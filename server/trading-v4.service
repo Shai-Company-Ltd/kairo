@@ -1,0 +1,20 @@
+[Unit]
+Description=Trading v4 - moteur BTCUSDT Bitunix (paper par defaut)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+WorkingDirectory=/opt/trading-v4/server
+Environment=ENV_FILE=/opt/trading-v4/server/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/trading-v4/venv/bin/python /opt/trading-v4/server/engine.py
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,107 @@
+INSTALLATION DU MOTEUR TRADING v4 SUR UN VPS UBUNTU (22.04 / 24.04)
+====================================================================
+Le moteur tourne 24h/24, ne consomme AUCUN token, et réveille les agents
+Grok Bot seulement quand il se passe quelque chose (webhook).
+Par défaut il est en PAPER (DRY_RUN=1) : aucun ordre réel.
+
+1) PRÉPARER LE SERVEUR (connecté en root ou avec sudo)
+-----------------------------------------------------
+sudo apt update && sudo apt -y upgrade
+sudo apt -y install python3 python3-venv python3-pip sqlite3 curl git ufw
+sudo timedatectl set-timezone UTC          # le moteur raisonne en UTC
+sudo adduser --system --group --home /opt/trading-v4 trader
+sudo ufw allow OpenSSH && sudo ufw --force enable
+
+2) COPIER LES FICHIERS
+----------------------
+Depuis ton PC (dossier trading-v4/server) :
+  scp -r server/ root@IP_DU_VPS:/opt/trading-v4/
+Sur le VPS :
+  sudo chown -R trader:trader /opt/trading-v4
+
+3) ENVIRONNEMENT PYTHON
+-----------------------
+sudo -u trader python3 -m venv /opt/trading-v4/venv
+sudo -u trader /opt/trading-v4/venv/bin/pip install -r /opt/trading-v4/server/requirements.txt
+
+4) CONFIGURATION (.env)
+-----------------------
+cd /opt/trading-v4/server
+sudo -u trader cp config.example.env .env
+sudo -u trader chmod 600 .env
+sudo -u trader nano .env
+  -> remplir WEBHOOK_URL et WEBHOOK_KEY (copiés depuis le panneau de la routine
+     de l'agent "bot trading" dans Grok Bot)
+  -> WEBHOOK_KEY_HEADER : laisser "Authorization: Bearer" sauf si le panneau
+     indique un autre nom de header (ex. "X-Webhook-Key" -> mettre WEBHOOK_KEY_HEADER=X-Webhook-Key)
+  -> laisser DRY_RUN=1 et LIVE=0 pour les premières 24 h
+
+5) TESTS AVANT DE LANCER
+------------------------
+a) Données publiques Bitunix (sans clé) :
+   curl -s "https://fapi.bitunix.com/api/v1/futures/market/kline?symbol=BTCUSDT&interval=1m&limit=2"
+b) Un passage du moteur :
+   cd /opt/trading-v4/server && sudo -u trader ENV_FILE=.env ../venv/bin/python engine.py --once
+c) Test du webhook via le moteur (doit afficher "webhook OK" et l'alerte doit
+   apparaître dans le groupe Grok Bot) :
+   sudo -u trader ENV_FILE=.env ../venv/bin/python engine.py --test-webhook
+d) Test du webhook à la main avec curl (remplacer URL et CLÉ) :
+   curl -i -X POST "URL_DU_WEBHOOK" \
+     -H "Content-Type: application/json" \
+     -H "Authorization: Bearer CLE_DU_WEBHOOK" \
+     -d '{"type":"test","timeframe":"15m","setup":"test","price":0,"sl":0,"tp":0,"confidence":0,"equity":25,"open_positions":0}'
+   Réponse 2xx = OK. 401/403 = mauvaise clé ou mauvais header : essayer
+     -H "X-Api-Key: CLE"  ou  -H "X-Webhook-Key: CLE"
+   puis reporter le bon nom dans WEBHOOK_KEY_HEADER.
+
+6) LANCER EN SERVICE (systemd)
+------------------------------
+sudo cp /opt/trading-v4/server/trading-v4.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now trading-v4
+sudo systemctl status trading-v4
+
+7) LOGS ET JOURNAL
+------------------
+journalctl -u trading-v4 -f                    # en direct
+journalctl -u trading-v4 --since "1 hour ago"
+cd /opt/trading-v4/server && sudo -u trader ENV_FILE=.env ../venv/bin/python engine.py --status
+sqlite3 journal.db "SELECT id,timeframe,setup,side,entry,exit,pnl,close_reason FROM trades ORDER BY id DESC LIMIT 20;"
+sqlite3 journal.db "SELECT ts,timeframe,setup,side,confidence,skip_reason FROM signals ORDER BY id DESC LIMIT 20;"
+sqlite3 journal.db "SELECT ts,type,sent,http_status,suppressed_reason FROM alerts ORDER BY id DESC LIMIT 20;"
+
+8) PASSER DE PAPER À LIVE (après 24 h de paper validées par l'équipe)
+--------------------------------------------------------------------
+a) Sur Bitunix : créer une clé API "Futures trading" SANS droit de retrait,
+   avec whitelist d'IP = IP du VPS. Mettre BTCUSDT en marge isolée x20
+   (le moteur le force aussi au démarrage).
+b) Mettre exactement 25 USDT sur le compte futures (rien de plus).
+c) nano .env :
+     BITUNIX_API_KEY=...
+     BITUNIX_API_SECRET=...
+     DRY_RUN=0
+     LIVE=1
+d) sudo systemctl restart trading-v4
+   journalctl -u trading-v4 -f   -> doit afficher "*** MODE LIVE : ORDRES RÉELS ***"
+e) Retour en paper à tout moment : DRY_RUN=1, LIVE=0, puis restart.
+   Le journal paper et le journal live sont séparés (colonne mode).
+
+9) ARRÊT D'URGENCE
+------------------
+sudo systemctl stop trading-v4      # arrête le moteur (les SL/TP restent posés chez Bitunix)
+Puis fermer la position à la main dans l'app Bitunix si besoin.
+Option : API de contrôle locale (CONTROL_PORT=8787, CONTROL_TOKEN=un_long_secret) :
+  curl -H "Authorization: Bearer SECRET" http://127.0.0.1:8787/status
+  curl -X POST -H "Authorization: Bearer SECRET" http://127.0.0.1:8787/pause
+  curl -X POST -H "Authorization: Bearer SECRET" http://127.0.0.1:8787/resume
+  curl -X POST -H "Authorization: Bearer SECRET" http://127.0.0.1:8787/close_all
+(Laisser CONTROL_BIND=127.0.0.1 ; ne pas l'ouvrir sur Internet sans HTTPS.)
+Après un kill switch (equity <= 12) : le moteur reste en HALT. Pour repartir,
+c'est une décision de Shaï : /resume ou supprimer la clé "halted" :
+  sqlite3 journal.db "DELETE FROM kv WHERE k='halted';" && sudo systemctl restart trading-v4
+
+10) MISE À JOUR
+---------------
+sudo systemctl stop trading-v4
+(copier le nouveau engine.py)  ; sudo chown trader:trader /opt/trading-v4/server/engine.py
+sudo systemctl start trading-v4

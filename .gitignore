@@ -1,0 +1,10 @@
+.env
+*.db
+*.db-*
+venv/
+.venv/
+__pycache__/
+*.pyc
+hf_cache/
+kronos/repo/
+*.log
