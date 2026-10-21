@@ -184,6 +184,12 @@ class Bitunix:
     def order_detail(self, client_id):
         return self.request("GET", "/api/v1/futures/trade/get_order_detail", {"clientId": client_id},
                             private=True, retries=2)
+    def close_qty(self, position_id, side, qty, prec=4):
+        """Fermeture PARTIELLE (hedge) : side = sens de la position (BUY=long)."""
+        return self.request("POST", "/api/v1/futures/trade/place_order",
+                            body={"symbol": SYMBOL, "side": "BUY" if side == "LONG" else "SELL",
+                                  "tradeSide": "CLOSE", "positionId": str(position_id),
+                                  "qty": fmt(qty, prec), "orderType": "MARKET"}, private=True, retries=1)
     def flash_close(self, position_id):
         return self.request("POST", "/api/v1/futures/trade/flash_close_position",
                             body={"positionId": str(position_id)}, private=True, retries=1)
@@ -578,6 +584,13 @@ class Engine:
 
     def plan(self, tf, side, a):
         px = self.price or a["close"]
+        if REAL_ORDERS:  # prix frais (dernière bougie 1m en cours)
+            try:
+                k = self.api.klines(SYMBOL, "1m", 1)
+                if k:
+                    px = float(k[0]["close"]); self.price = px
+            except Exception as e:
+                log.warning("prix frais: %s", e)
         sl_dist = max(ATR_SL_MULT * a["atr"], px * MIN_SL_PCT / 100)
         sgn = 1 if side == "LONG" else -1
         sl, tp = px - sgn * sl_dist, px + sgn * RR * sl_dist
@@ -619,6 +632,10 @@ class Engine:
                 skip = "info"
             elif s["confidence"] < MIN_CONF_TRADE:
                 skip = f"confiance {s['confidence']} < {MIN_CONF_TRADE}"
+            elif (s["side"] == "LONG" and not (p["sl"] < p["price"] < p["tp"])) or \
+                 (s["side"] == "SHORT" and not (p["tp"] < p["price"] < p["sl"])):
+                skip = f"plan invalide (prix {p['price']} sl {p['sl']} tp {p['tp']})"
+                log.error("plan invalide rejeté %s %s %s", tf, s["side"], skip)
             elif p["qty"] < self.min_qty:
                 skip = (f"marge disponible insuffisante ({p['available']:.2f} USDT) : qty {p['qty']} < min {self.min_qty}"
                         if p.get("available") is not None else f"qty {p['qty']} < min {self.min_qty}")
@@ -655,6 +672,12 @@ class Engine:
         pos_id = None
         entry = p["price"]
         if REAL_ORDERS:
+            before = {}
+            try:
+                for ps in self.api.positions(SYMBOL):
+                    before[str(ps.get("positionId"))] = (float(ps.get("qty") or 0), float(ps.get("avgOpenPrice") or 0))
+            except Exception as e:
+                log.warning("positions() avant ordre: %s", e)
             body = {"symbol": SYMBOL, "side": "BUY" if side == "LONG" else "SELL", "tradeSide": "OPEN",
                     "orderType": "MARKET", "qty": fmt(p["qty"], self.qty_prec), "clientId": cid,
                     "slPrice": fmt(p["sl"], self.px_prec), "slStopType": "MARK_PRICE", "slOrderType": "MARKET",
@@ -677,7 +700,13 @@ class Engine:
                 for ps in self.api.positions(SYMBOL):
                     if (ps.get("side") or "").upper() in (("BUY", "LONG") if side == "LONG" else ("SELL", "SHORT")):
                         pos_id = ps.get("positionId")
-                        entry = float(ps.get("avgOpenPrice") or entry)
+                        q1, a1 = float(ps.get("qty") or 0), float(ps.get("avgOpenPrice") or 0)
+                        q0, a0 = before.get(str(pos_id), (0.0, 0.0))
+                        # position fusionnée (hedge) : prix de remplissage = delta, pas la moyenne globale
+                        if q1 - q0 > 1e-12 and a1:
+                            fill = (q1 * a1 - q0 * a0) / (q1 - q0)
+                            if abs(fill - entry) / entry < 0.02:
+                                entry = round(fill, 1)
             except Exception as e:
                 log.warning("positions(): %s", e)
         tid = self.db.x("INSERT INTO trades(mode,opened_ts,timeframe,setup,side,entry,qty,leverage,margin,sl,tp,"
@@ -692,6 +721,13 @@ class Engine:
                          "trade_id": tid, "equity": round(self.equity(), 2),
                          "open_positions": len(self.open_trades())}, key=f"open:{tid}")
         return True
+
+    def close_live(self, t):
+        """Ferme uniquement la part de CE trade si la position exchange est partagée."""
+        others = [o for o in self.open_trades() if o["id"] != t["id"] and o["position_id"] == t["position_id"]]
+        if others:
+            return self.api.close_qty(t["position_id"], t["side"], t["qty"], self.qty_prec)
+        return self.api.flash_close(t["position_id"])
 
     def manage(self):
         """Suivi SL/TP/temps. Paper : simulé sur la bougie 1m. Live : sync avec l'exchange."""
@@ -725,8 +761,8 @@ class Engine:
             if exit_px is None and age_h >= (t["max_hold_h"] or 24):
                 exit_px, reason = self.price, "temps max"
                 if REAL_ORDERS and t["position_id"]:
-                    try: self.api.flash_close(t["position_id"])
-                    except Exception as e: log.error("flash_close: %s", e); continue
+                    try: self.close_live(t)
+                    except Exception as e: log.error("close: %s", e); continue
             if exit_px is not None:
                 self.close_trade(t, exit_px, reason)
 
