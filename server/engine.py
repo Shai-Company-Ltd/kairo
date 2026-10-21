@@ -585,12 +585,23 @@ class Engine:
         risk = eq * RISK_PCT / 100
         qty = risk / sl_dist
         max_qty = eq * MAX_MARGIN_PCT / 100 * LEVERAGE / px
-        qty = round_down(min(qty, max_qty), self.qty_prec)
+        avail = None
+        if REAL_ORDERS:  # clamp sur la marge DISPONIBLE (évite 20003 Insufficient balance)
+            try:
+                ac = self.api.account()
+                ac = ac[0] if isinstance(ac, list) else ac
+                avail = float(ac.get("available", 0) or 0)
+                # 0.95 : marge de sécurité pour frais d'ouverture
+                max_qty = min(max_qty, avail * 0.95 * LEVERAGE / px / (1 + FEE_RATE * LEVERAGE))
+            except Exception as e:
+                log.warning("account() pour sizing: %s", e)
+        qty = round_down(max(min(qty, max_qty), 0), self.qty_prec)
         fees = FEE_RATE * qty * px * 2
         real_risk = qty * sl_dist + fees
         return {"price": round(px, 1), "sl": round(sl, self.px_prec), "tp": round(tp, self.px_prec), "qty": qty,
                 "sl_dist": sl_dist, "risk_usdt": round(real_risk, 3), "fees": round(fees, 3),
-                "margin": round(qty * px / LEVERAGE, 3), "fee_share": fees / max(qty * sl_dist, 1e-9)}
+                "margin": round(qty * px / LEVERAGE, 3), "fee_share": fees / max(qty * sl_dist, 1e-9),
+                "available": avail}
 
     # -- signals
     def on_close(self, tf):
@@ -609,7 +620,8 @@ class Engine:
             elif s["confidence"] < MIN_CONF_TRADE:
                 skip = f"confiance {s['confidence']} < {MIN_CONF_TRADE}"
             elif p["qty"] < self.min_qty:
-                skip = f"qty {p['qty']} < min {self.min_qty}"
+                skip = (f"marge disponible insuffisante ({p['available']:.2f} USDT) : qty {p['qty']} < min {self.min_qty}"
+                        if p.get("available") is not None else f"qty {p['qty']} < min {self.min_qty}")
             elif p["fee_share"] > MAX_FEE_SHARE:
                 skip = f"frais {p['fee_share']:.0%} du risque > {MAX_FEE_SHARE:.0%}"
             else:
