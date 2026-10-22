@@ -190,6 +190,12 @@ class Bitunix:
                             body={"symbol": SYMBOL, "side": "BUY" if side == "LONG" else "SELL",
                                   "tradeSide": "CLOSE", "positionId": str(position_id),
                                   "qty": fmt(qty, prec), "orderType": "MARKET"}, private=True, retries=1)
+    def tpsl_pending(self, symbol=None):
+        d = self.request("GET", "/api/v1/futures/tpsl/get_pending_orders", {"symbol": symbol}, private=True)
+        return d if isinstance(d, list) else (d or {}).get("orderList", []) if isinstance(d, dict) else []
+    def tpsl_cancel(self, order_id):
+        return self.request("POST", "/api/v1/futures/tpsl/cancel_order",
+                            body={"symbol": SYMBOL, "orderId": str(order_id)}, private=True, retries=1)
     def flash_close(self, position_id):
         return self.request("POST", "/api/v1/futures/trade/flash_close_position",
                             body={"positionId": str(position_id)}, private=True, retries=1)
@@ -722,12 +728,42 @@ class Engine:
                          "open_positions": len(self.open_trades())}, key=f"open:{tid}")
         return True
 
+    @staticmethod
+    def own_tpsl(t, orders):
+        """Ordres TP/SL Bitunix appartenant à CE trade (même position, prix SL/TP du trade)."""
+        out = []
+        for o in orders or []:
+            if str(o.get("positionId")) != str(t["position_id"]):
+                continue
+            sl, tp = o.get("slPrice"), o.get("tpPrice")
+            if (sl and t["sl"] and abs(float(sl) - t["sl"]) < 0.06) or (tp and t["tp"] and abs(float(tp) - t["tp"]) < 0.06):
+                out.append(o)
+        return out
+
     def close_live(self, t):
-        """Ferme uniquement la part de CE trade si la position exchange est partagée."""
+        """Ferme uniquement la part de CE trade si la position exchange est partagée.
+        Qty plafonnée à la taille actuelle de la position ; annule ensuite les TP/SL propres du trade."""
         others = [o for o in self.open_trades() if o["id"] != t["id"] and o["position_id"] == t["position_id"]]
-        if others:
-            return self.api.close_qty(t["position_id"], t["side"], t["qty"], self.qty_prec)
-        return self.api.flash_close(t["position_id"])
+        if not others:
+            return self.api.flash_close(t["position_id"])
+        pos_qty = None
+        for ps in self.api.positions(SYMBOL):
+            if str(ps.get("positionId")) == str(t["position_id"]):
+                pos_qty = float(ps.get("qty") or 0)
+        if not pos_qty:
+            raise RuntimeError("position introuvable pour fermeture partielle")
+        orders = self.api.tpsl_pending(SYMBOL)
+        mine = self.own_tpsl(t, orders)
+        if not mine:
+            raise RuntimeError("TP/SL propres absents (trade déjà fermé ?) : pas de fermeture partielle")
+        qty = round_down(min(t["qty"], pos_qty), self.qty_prec)
+        if qty < self.min_qty:
+            raise RuntimeError(f"qty de fermeture {qty} < min")
+        r = self.api.close_qty(t["position_id"], t["side"], qty, self.qty_prec)
+        for o in mine:
+            try: self.api.tpsl_cancel(o.get("id"))
+            except Exception as e: log.warning("tpsl_cancel %s: %s", o.get("id"), e)
+        return r
 
     def manage(self):
         """Suivi SL/TP/temps. Paper : simulé sur la bougie 1m. Live : sync avec l'exchange."""
@@ -737,11 +773,16 @@ class Engine:
         if getattr(self, "live_1m", None):
             bars.append(self.live_1m)
         live_pos = None
+        tpsl = None
         if REAL_ORDERS and self.open_trades():
             try:
                 live_pos = {str(p.get("positionId")) for p in self.api.positions(SYMBOL)}
             except Exception as e:
                 log.warning("positions(): %s", e)
+            try:
+                tpsl = self.api.tpsl_pending(SYMBOL)
+            except Exception as e:
+                log.warning("tpsl_pending(): %s", e)
         for t in self.open_trades():
             opened_ms = datetime.fromisoformat(t["opened_ts"]).timestamp() * 1000
             seg = [b for b in bars if b["t"] + 60000 > opened_ms] or [{"h": self.price, "l": self.price}]
@@ -750,6 +791,11 @@ class Engine:
             if REAL_ORDERS:
                 if live_pos is not None and t["position_id"] and str(t["position_id"]) not in live_pos:
                     exit_px, reason = self.price, "fermée sur l'exchange (SL/TP)"
+                elif tpsl is not None and live_pos is not None and t["position_id"] and \
+                        time.time() * 1000 - opened_ms > 90000 and not self.own_tpsl(t, tpsl):
+                    # ses propres TP/SL ont disparu -> exécutés (position fusionnée toujours ouverte)
+                    hit_sl = abs(self.price - t["sl"]) <= abs(self.price - t["tp"])
+                    exit_px, reason = (t["sl"], "SL propre exécuté") if hit_sl else (t["tp"], "TP propre exécuté")
             else:
                 if t["side"] == "LONG":
                     if lo <= t["sl"]: exit_px, reason = t["sl"], "SL"
