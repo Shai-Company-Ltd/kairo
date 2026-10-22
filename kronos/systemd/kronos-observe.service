@@ -1,0 +1,15 @@
+[Unit]
+Description=Kronos-mini observation BTCUSDT (no trading)
+[Service]
+Type=oneshot
+User=trader
+Group=trader
+WorkingDirectory=/opt/kronos
+Environment=HF_HOME=/opt/kronos/hf_cache
+Environment=OMP_NUM_THREADS=1
+ExecStart=/opt/kronos/venv/bin/python /opt/kronos/observe.py
+MemoryMax=900M
+MemorySwapMax=0
+CPUQuota=50%
+Nice=10
+TimeoutStartSec=600

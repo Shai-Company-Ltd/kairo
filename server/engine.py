@@ -193,6 +193,14 @@ class Bitunix:
     def tpsl_pending(self, symbol=None):
         d = self.request("GET", "/api/v1/futures/tpsl/get_pending_orders", {"symbol": symbol}, private=True)
         return d if isinstance(d, list) else (d or {}).get("orderList", []) if isinstance(d, dict) else []
+    def tpsl_history(self, symbol=None):
+        d = self.request("GET", "/api/v1/futures/tpsl/get_history_orders", {"symbol": symbol}, private=True)
+        return d if isinstance(d, list) else (d or {}).get("orderList", []) if isinstance(d, dict) else []
+    def tpsl_place(self, position_id, qty, sl, tp, qprec=4, pprec=1):
+        body = {"symbol": SYMBOL, "positionId": str(position_id),
+                "slPrice": fmt(sl, pprec), "slStopType": "MARK_PRICE", "slOrderType": "MARKET", "slQty": fmt(qty, qprec),
+                "tpPrice": fmt(tp, pprec), "tpStopType": "MARK_PRICE", "tpOrderType": "MARKET", "tpQty": fmt(qty, qprec)}
+        return self.request("POST", "/api/v1/futures/tpsl/place_order", body=body, private=True, retries=1)
     def tpsl_cancel(self, order_id):
         return self.request("POST", "/api/v1/futures/tpsl/cancel_order",
                             body={"symbol": SYMBOL, "orderId": str(order_id)}, private=True, retries=1)
@@ -769,11 +777,58 @@ class Engine:
         qty = round_down(min(t["qty"], pos_qty), self.qty_prec)
         if qty < self.min_qty:
             raise RuntimeError(f"qty de fermeture {qty} < min")
-        r = self.api.close_qty(t["position_id"], t["side"], qty, self.qty_prec)
+        # annuler D'ABORD ses propres TP/SL : sinon Bitunix SYSTEM_CANCEL des TP/SL d'autres trades
         for o in mine:
             try: self.api.tpsl_cancel(o.get("id"))
             except Exception as e: log.warning("tpsl_cancel %s: %s", o.get("id"), e)
+        time.sleep(0.5)
+        r = self.api.close_qty(t["position_id"], t["side"], qty, self.qty_prec)
+        time.sleep(1.0)
+        self.repair_tpsl(t["position_id"], exclude=t["id"])
         return r
+
+    def repair_tpsl(self, position_id, exclude=None):
+        """Re-pose les TP/SL manquants des autres trades ouverts sur la position."""
+        try:
+            pend = self.api.tpsl_pending(SYMBOL)
+        except Exception as e:
+            log.warning("repair tpsl_pending: %s", e); return
+        for o in self.open_trades():
+            if o["id"] == exclude or str(o["position_id"]) != str(position_id):
+                continue
+            if not self.own_tpsl(o, pend):
+                self.replace_tpsl(o)
+
+    def replace_tpsl(self, t):
+        px = self.price
+        ok_side = px and ((t["side"] == "LONG" and t["sl"] < px < t["tp"]) or
+                          (t["side"] == "SHORT" and t["tp"] < px < t["sl"]))
+        if not ok_side:
+            log.error("TP/SL de #%s non re-posables (prix %s hors sl/tp) -> fermeture de sa part", t["id"], px)
+            try:
+                self.api.close_qty(t["position_id"], t["side"], t["qty"], self.qty_prec)
+                self.close_trade(t, px, "TP/SL annulés par Bitunix, fermé au marché")
+            except Exception as e:
+                log.error("close_qty #%s: %s", t["id"], e)
+            return
+        try:
+            self.api.tpsl_place(t["position_id"], t["qty"], t["sl"], t["tp"], self.qty_prec, self.px_prec)
+            self.db.ev("tpsl_replaced", {"trade": t["id"], "sl": t["sl"], "tp": t["tp"], "qty": t["qty"]}, level="WARNING")
+        except Exception as e:
+            log.error("tpsl_place #%s: %s", t["id"], e)
+
+    def _tpsl_canceled(self, t):
+        """True si les TP/SL du trade ont été ANNULÉS (pas exécutés) -> on les re-pose, trade reste ouvert."""
+        try:
+            hist = self.own_tpsl(t, self.api.tpsl_history(SYMBOL))
+        except Exception as e:
+            log.warning("tpsl_history: %s", e); return True   # dans le doute, ne pas déclarer fermé
+        st = [str(o.get("status") or "").upper() for o in hist]
+        if st and all("CANCEL" in x for x in st):
+            log.warning("TP/SL de #%s annulés (%s) -> re-pose", t["id"], st)
+            self.replace_tpsl(t)
+            return True
+        return False
 
     def manage(self):
         """Suivi SL/TP/temps. Paper : simulé sur la bougie 1m. Live : sync avec l'exchange."""
@@ -802,7 +857,8 @@ class Engine:
                 if live_pos is not None and t["position_id"] and str(t["position_id"]) not in live_pos:
                     exit_px, reason = self.price, "fermée sur l'exchange (SL/TP)"
                 elif tpsl is not None and live_pos is not None and t["position_id"] and \
-                        time.time() * 1000 - opened_ms > 90000 and not self.own_tpsl(t, tpsl):
+                        time.time() * 1000 - opened_ms > 90000 and not self.own_tpsl(t, tpsl) and \
+                        not self._tpsl_canceled(t):
                     # ses propres TP/SL ont disparu -> exécutés (position fusionnée toujours ouverte)
                     hit_sl = abs(self.price - t["sl"]) <= abs(self.price - t["tp"])
                     exit_px, reason = (t["sl"], "SL propre exécuté") if hit_sl else (t["tp"], "TP propre exécuté")
