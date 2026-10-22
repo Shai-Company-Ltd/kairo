@@ -372,6 +372,8 @@ def parse_key_header(spec, key):
 class Alerter:
     PRIORITY = {"trade_open", "trade_close", "risk", "kill_switch", "target", "test", "digest", "startup"}
 
+    ALWAYS = {"trade_open", "trade_close", "kill_switch"}
+
     def __init__(self, db):
         self.db = db
         self.s = requests.Session()
@@ -385,6 +387,8 @@ class Alerter:
                    "mode": "LIVE" if REAL_ORDERS else "PAPER", **payload}
         day = self._today()
         reason = None
+        if typ in self.ALWAYS:   # jamais plafonnés
+            force = True
         if not force:
             if typ in self.PRIORITY:
                 n = self.db.q("SELECT COUNT(*) n FROM alerts WHERE sent=1 AND substr(ts,1,10)=? AND type IN "
@@ -414,14 +418,20 @@ class Alerter:
             if WEBHOOK_KEY:
                 hn, hv = parse_key_header(WEBHOOK_KEY_HEADER, WEBHOOK_KEY)
                 h[hn] = hv
-            try:
-                r = self.s.post(WEBHOOK_URL, json=payload, headers=h, timeout=WEBHOOK_TIMEOUT)
-                status = r.status_code
-                if status >= 300:
-                    log.warning("webhook HTTP %s: %s", status, r.text[:200])
-            except requests.RequestException as e:
-                log.warning("webhook erreur: %s", e)
-                status = -1
+            for attempt in range(3):   # 1 essai + 2 retries (connexion / 5xx)
+                try:
+                    r = self.s.post(WEBHOOK_URL, json=payload, headers=h, timeout=WEBHOOK_TIMEOUT)
+                    status = r.status_code
+                    if status >= 300:
+                        log.warning("webhook HTTP %s: %s", status, r.text[:200])
+                    if status < 500:
+                        break
+                except requests.RequestException as e:
+                    log.warning("webhook erreur (essai %d): %s", attempt + 1, e)
+                    status = -1
+                    self.s = requests.Session()   # connexion keep-alive morte -> nouvelle session
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
         else:
             log.info("WEBHOOK_URL vide -> alerte seulement loggée")
         ok = status is None or 200 <= status < 300
