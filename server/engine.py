@@ -1052,6 +1052,84 @@ class Engine:
                 out.append(o)
         return out
 
+    def _own_sl_filled(self, t):
+        """True si le SL propre du trade apparaît EXÉCUTÉ dans l'historique TP/SL Bitunix."""
+        try:
+            hist = self.api.tpsl_history(SYMBOL)
+        except Exception as e:
+            log.warning("tpsl_history: %s", e); return None
+        t0 = datetime.fromisoformat(t["opened_ts"]).timestamp() * 1000 - 60000
+        for o in hist or []:
+            if str(o.get("positionId")) != str(t["position_id"]) or not o.get("slPrice"):
+                continue
+            if abs(float(o["slPrice"]) - t["sl"]) < 0.06 and float(o.get("ctime") or 0) >= t0 and \
+                    "FILLED" in str(o.get("status") or "").upper():
+                return True
+        return False
+
+    def fix_missing_sl(self, t, mine, live_pos):
+        """v4.1.1 : SL absent -> (a) SL déjà exécuté ? trade clos + TP orphelin annulé ;
+        (b) sinon re-pose immédiate du SL ; (c) prix au-delà du SL ou 2 échecs -> fermeture au marché de SA qty."""
+        tid = str(t["id"])
+        filled = self._own_sl_filled(t)
+        if filled:
+            for o in mine:   # TP orphelin : il agirait sur la qty des autres trades
+                try: self.api.tpsl_cancel(o.get("id"))
+                except Exception as e: log.warning("tpsl_cancel orphelin %s: %s", o.get("id"), e)
+            self.db.ev("sl_filled_detected", {"trade": t["id"]}, level="WARNING")
+            return t["sl"], "SL propre exécuté"
+        fails = self.db.get("sl_fix_fail", {}) or {}
+        px = self.price
+        beyond = px is None or (t["side"] == "LONG" and px <= t["sl"]) or (t["side"] == "SHORT" and px >= t["sl"])
+        if not beyond and filled is not None:
+            try:
+                self.api.request("POST", "/api/v1/futures/tpsl/place_order", private=True, retries=1, body={
+                    "symbol": SYMBOL, "positionId": str(t["position_id"]), "slPrice": fmt(t["sl"], self.px_prec),
+                    "slStopType": "MARK_PRICE", "slOrderType": "MARKET", "slQty": fmt(t["qty"], self.qty_prec)})
+                fails.pop(tid, None); self.db.set("sl_fix_fail", fails)
+                self.db.ev("sl_reposed", {"trade": t["id"], "sl": t["sl"], "qty": t["qty"]}, level="WARNING")
+                self.urgent("no_sl", f"#{t['id']} SL absent -> SL {t['sl']} re-posé automatiquement", key=f"slok:{t['id']}")
+                return None
+            except Exception as e:
+                fails[tid] = fails.get(tid, 0) + 1; self.db.set("sl_fix_fail", fails)
+                log.error("re-pose SL #%s échec %d: %s", t["id"], fails[tid], e)
+                if fails[tid] < 2:
+                    return None
+        elif not beyond:
+            return None   # historique illisible : on réessaie au prochain tour
+        # fermeture au marché de la seule qty du trade (plafonnée à la position)
+        qty = round_down(min(t["qty"], (live_pos or {}).get(str(t["position_id"]), t["qty"])), self.qty_prec)
+        for o in mine:
+            try: self.api.tpsl_cancel(o.get("id"))
+            except Exception as e: log.warning("tpsl_cancel %s: %s", o.get("id"), e)
+        try:
+            if qty >= self.min_qty:
+                self.api.close_qty(t["position_id"], t["side"], qty, self.qty_prec)
+            fails.pop(tid, None); self.db.set("sl_fix_fail", fails)
+            self.urgent("no_sl", f"#{t['id']} SL non re-posable ({'prix au-delà du SL' if beyond else '2 échecs'}) "
+                                 f"-> fermé au marché qty {qty}", key=f"slclose:{t['id']}")
+            time.sleep(1.0)
+            self.repair_tpsl(t["position_id"], exclude=t["id"])
+            return self.price, "SL absent : fermé au marché"
+        except Exception as e:
+            self.urgent("no_sl", f"#{t['id']} SANS SL et fermeture au marché ÉCHOUÉE: {e}", key=f"slclosefail:{t['id']}")
+            return None
+
+    def repose_tp(self, t, live_pos):
+        """TP propre annulé (ex. SYSTEM_CANCELED après réduction de la position) -> re-pose."""
+        px = self.price
+        if not px or not ((t["side"] == "LONG" and px < t["tp"]) or (t["side"] == "SHORT" and px > t["tp"])):
+            return
+        body = {"symbol": SYMBOL, "positionId": str(t["position_id"]), "tpPrice": fmt(t["tp"], self.px_prec),
+                "tpStopType": "MARK_PRICE", "tpOrderType": "MARKET", "tpQty": fmt(t["qty"], self.qty_prec)}
+        if TP_LIMIT:
+            body["tpOrderType"], body["tpOrderPrice"] = "LIMIT", fmt(t["tp"], self.px_prec)
+        try:
+            self.api.request("POST", "/api/v1/futures/tpsl/place_order", body=body, private=True, retries=1)
+            self.db.ev("tp_reposed", {"trade": t["id"], "tp": t["tp"]}, level="WARNING")
+        except Exception as e:
+            log.error("re-pose TP #%s: %s", t["id"], e)
+
     def _tp_limit_unfilled(self, t, live_pos):
         """TP limite déclenché mais pas rempli ? (position pas réduite de la qty du trade) -> sécurise."""
         pid = str(t["position_id"])
@@ -1185,8 +1263,14 @@ class Engine:
                 elif tpsl is not None and live_pos is not None and t["position_id"] and \
                         time.time() * 1000 - opened_ms > 90000:
                     mine = self.own_tpsl(t, tpsl)
-                    if mine and not any(o.get("slPrice") and abs(float(o["slPrice"]) - t["sl"]) < 0.06 for o in mine):
-                        self.urgent("no_sl", f"#{t['id']} {t['side']} sans SL sur Bitunix (TP seul présent)", key=f"nosl:{t['id']}")
+                    has_sl = any(o.get("slPrice") and abs(float(o["slPrice"]) - t["sl"]) < 0.06 for o in mine)
+                    has_tp = any(o.get("tpPrice") and abs(float(o["tpPrice"]) - t["tp"]) < 0.06 for o in mine)
+                    if mine and not has_sl:
+                        r = self.fix_missing_sl(t, mine, live_pos)
+                        if r:
+                            exit_px, reason = r
+                    elif mine and not has_tp:
+                        self.repose_tp(t, live_pos)
             else:
                 if t["side"] == "LONG":
                     if lo <= t["sl"]: exit_px, reason = t["sl"], "SL"
