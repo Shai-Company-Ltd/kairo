@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Moteur trading v4 — BTCUSDT Bitunix USDT-M, x10 isolé, multi-timeframes.
+"""Moteur trading v4.1 — BTCUSDT Bitunix USDT-M, isolé, hedge, multi-timeframes.
+
+v4.1 : webhooks groupés (récap 3 h), urgences immédiates (regroupées à la minute),
+digest texte 1x/jour, 1m hors trading, filtre ADX, entrée limite post-only 20 s, TP limite.
+Chaque nouveauté est désactivable dans .env (voir bloc v4.1).
 
 Zéro token LLM : il surveille le marché, gère le risque, journalise en SQLite
 et ne réveille les agents Grok Bot (webhook) que sur un événement notable.
@@ -81,6 +85,23 @@ DIGEST_HOURS_UTC = [int(h) for h in E("DIGEST_HOURS_UTC", "6,18").split(",") if 
 CONTROL_PORT = E("CONTROL_PORT", 0, int)
 CONTROL_TOKEN = E("CONTROL_TOKEN", "")
 CONTROL_BIND = E("CONTROL_BIND", "127.0.0.1")
+
+# ---------- v4.1 (chaque nouveauté désactivable)
+WEBHOOK_BATCH = E("WEBHOOK_BATCH", True, bool)          # trade_open/close/setup en tampon -> récap groupé
+BATCH_HOURS = E("BATCH_HOURS", 3.0, float)              # période du récap
+BATCH_SEND_EMPTY = E("BATCH_SEND_EMPTY", False, bool)   # envoyer le récap même sans événement
+URGENT_COALESCE = E("URGENT_COALESCE", True, bool)      # urgences de la même minute -> un seul envoi
+URGENT_DD_PCT = E("URGENT_DD_PCT", 15.0, float)         # drawdown du jour -> alerte urgente (0 = off)
+URGENT_ERR_COOLDOWN_MIN = E("URGENT_ERR_COOLDOWN_MIN", 30, int)  # même erreur pas renvoyée avant N min
+DIGEST_TEXT = E("DIGEST_TEXT", True, bool)              # digest = texte formaté en code
+ADX_FILTER = E("ADX_FILTER", True, bool)
+ADX_PERIOD = E("ADX_PERIOD", 14, int)
+ADX_MIN = E("ADX_MIN", 20.0, float)
+ENTRY_POST_ONLY = E("ENTRY_POST_ONLY", True, bool)      # entrée limite post-only au meilleur prix
+POST_ONLY_SUPPORTED = E("POST_ONLY_SUPPORTED", True, bool)  # 0 -> limite GTC simple au meilleur prix
+ENTRY_TIMEOUT_SEC = E("ENTRY_TIMEOUT_SEC", 20, int)     # non rempli -> annulé, jamais chassé
+TP_LIMIT = E("TP_LIMIT", True, bool)                    # TP en ordre limite (SL toujours au marché)
+URGENT_TYPES = {"kill_switch", "risk", "api_error", "order_error", "no_sl", "drawdown"}
 
 TF_SEC = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400}
 TF_REFRESH = {"1m": 15, "5m": 30, "15m": 60, "30m": 90, "1h": 120, "2h": 180, "4h": 300, "1d": 600}
@@ -200,10 +221,21 @@ class Bitunix:
         body = {"symbol": SYMBOL, "positionId": str(position_id),
                 "slPrice": fmt(sl, pprec), "slStopType": "MARK_PRICE", "slOrderType": "MARKET", "slQty": fmt(qty, qprec),
                 "tpPrice": fmt(tp, pprec), "tpStopType": "MARK_PRICE", "tpOrderType": "MARKET", "tpQty": fmt(qty, qprec)}
+        if TP_LIMIT:   # v4.1 : TP limite au prix du TP ; SL reste au marché
+            body["tpOrderType"], body["tpOrderPrice"] = "LIMIT", fmt(tp, pprec)
         return self.request("POST", "/api/v1/futures/tpsl/place_order", body=body, private=True, retries=1)
     def tpsl_cancel(self, order_id):
         return self.request("POST", "/api/v1/futures/tpsl/cancel_order",
                             body={"symbol": SYMBOL, "orderId": str(order_id)}, private=True, retries=1)
+    def depth(self, symbol, limit=1):
+        return self.request("GET", "/api/v1/futures/market/depth", {"symbol": symbol, "limit": limit})
+    def cancel_orders(self, symbol, order_ids=(), client_ids=()):
+        ol = [{"orderId": str(i)} for i in order_ids] + [{"clientId": str(c)} for c in client_ids]
+        return self.request("POST", "/api/v1/futures/trade/cancel_orders",
+                            body={"symbol": symbol, "orderList": ol}, private=True, retries=1)
+    def pending_orders(self, symbol=None):
+        d = self.request("GET", "/api/v1/futures/trade/get_pending_orders", {"symbol": symbol}, private=True)
+        return d if isinstance(d, list) else (d or {}).get("orderList", []) if isinstance(d, dict) else []
     def flash_close(self, position_id):
         return self.request("POST", "/api/v1/futures/trade/flash_close_position",
                             body={"positionId": str(position_id)}, private=True, retries=1)
@@ -241,6 +273,32 @@ def atr(c, n=14):
         a = (a * (n - 1) + t) / n
     return a
 
+def adx(c, n=14):
+    """ADX de Wilder. None si historique insuffisant."""
+    if len(c) < 2 * n + 2:
+        return None
+    trs, pdm, mdm = [], [], []
+    for i in range(1, len(c)):
+        up, dn = c[i]["h"] - c[i - 1]["h"], c[i - 1]["l"] - c[i]["l"]
+        pdm.append(up if up > dn and up > 0 else 0.0)
+        mdm.append(dn if dn > up and dn > 0 else 0.0)
+        trs.append(max(c[i]["h"] - c[i]["l"], abs(c[i]["h"] - c[i - 1]["c"]), abs(c[i]["l"] - c[i - 1]["c"])))
+    tr_s, p_s, m_s = sum(trs[:n]), sum(pdm[:n]), sum(mdm[:n])
+    dxs = []
+    for i in range(n, len(trs) + 1):
+        if i > n:
+            tr_s = tr_s - tr_s / n + trs[i - 1]; p_s = p_s - p_s / n + pdm[i - 1]; m_s = m_s - m_s / n + mdm[i - 1]
+        if tr_s <= 0:
+            dxs.append(0.0); continue
+        pdi, mdi = 100 * p_s / tr_s, 100 * m_s / tr_s
+        dxs.append(0.0 if pdi + mdi == 0 else 100 * abs(pdi - mdi) / (pdi + mdi))
+    if len(dxs) < n:
+        return None
+    a = sum(dxs[:n]) / n
+    for d in dxs[n:]:
+        a = (a * (n - 1) + d) / n
+    return a
+
 def vwap(c, n=None):
     seg = c[-n:] if n else c
     v = sum(x["v"] for x in seg)
@@ -272,7 +330,7 @@ def analyse(c, tf="1h"):
     return {"close": last["c"], "high": last["h"], "low": last["l"], "open": last["o"], "t": last["t"],
             "ema20": e20[-1], "ema50": e50[-1], "ema200": e200[-1],
             "ema20_prev": e20[-2] if len(e20) > 1 else None,
-            "rsi": rsi(cl), "rsi_prev": rsi(cl[:-1]), "atr": atr(c),
+            "rsi": rsi(cl), "rsi_prev": rsi(cl[:-1]), "atr": atr(c), "adx": adx(c, ADX_PERIOD),
             "vwap": session_vwap(c) if TF_SEC.get(tf, 0) <= 3600 else None,
             "vwap50": vwap(c, 50), "vol": last["v"], "vol_avg": vavg,
             "vol_ratio": (last["v"] / vavg) if vavg else None,
@@ -297,18 +355,19 @@ def detect(tf, a, ctx):
             c += 0.03 if (px - a["vwap"]) * side > 0 else -0.03
         return round(max(0.0, min(0.95, c)), 2)
 
-    # 1) cassure du range 20 bougies avec volume
-    if a["hi20"] and px > a["hi20"] and vr >= 1.5 and a["trend"] >= 0:
+    trend_ok = (not ADX_FILTER) or (a.get("adx") is not None and a["adx"] > ADX_MIN)
+    # 1) cassure du range 20 bougies avec volume (v4.1 : seulement si ADX > ADX_MIN)
+    if trend_ok and a["hi20"] and px > a["hi20"] and vr >= 1.5 and a["trend"] >= 0:
         out.append({"setup": "breakout", "side": "LONG", "confidence": conf(0.55, 1),
                     "why": f"close>{a['hi20']:.1f} (haut 20), vol x{vr:.1f}"})
-    if a["lo20"] and px < a["lo20"] and vr >= 1.5 and a["trend"] <= 0:
+    if trend_ok and a["lo20"] and px < a["lo20"] and vr >= 1.5 and a["trend"] <= 0:
         out.append({"setup": "breakout", "side": "SHORT", "confidence": conf(0.55, -1),
                     "why": f"close<{a['lo20']:.1f} (bas 20), vol x{vr:.1f}"})
     # 2) pullback sur EMA20 dans la tendance
-    if a["trend"] == 1 and a["low"] <= a["ema20"] < px and 40 <= a["rsi"] <= 60 and px > a["open"]:
+    if trend_ok and a["trend"] == 1 and a["low"] <= a["ema20"] < px and 40 <= a["rsi"] <= 60 and px > a["open"]:
         out.append({"setup": "pullback_ema20", "side": "LONG", "confidence": conf(0.52, 1),
                     "why": f"tendance haussière, rebond EMA20 {a['ema20']:.1f}, RSI {a['rsi']:.0f}"})
-    if a["trend"] == -1 and a["high"] >= a["ema20"] > px and 40 <= a["rsi"] <= 60 and px < a["open"]:
+    if trend_ok and a["trend"] == -1 and a["high"] >= a["ema20"] > px and 40 <= a["rsi"] <= 60 and px < a["open"]:
         out.append({"setup": "pullback_ema20", "side": "SHORT", "confidence": conf(0.52, -1),
                     "why": f"tendance baissière, rejet EMA20 {a['ema20']:.1f}, RSI {a['rsi']:.0f}"})
     # 3) excès RSI + spike de volume + bougie de retournement (contre-tendance, confiance plus basse)
@@ -378,7 +437,8 @@ def parse_key_header(spec, key):
     return spec, key
 
 class Alerter:
-    PRIORITY = {"trade_open", "trade_close", "risk", "kill_switch", "target", "test", "digest", "startup"}
+    PRIORITY = {"trade_open", "trade_close", "risk", "kill_switch", "target", "test", "digest", "startup",
+                "batch_summary", "urgent_batch", "api_error", "order_error", "no_sl", "drawdown"}
 
     ALWAYS = {"trade_open", "trade_close", "kill_switch"}
 
@@ -389,7 +449,75 @@ class Alerter:
     def _today(self):
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
+    # ---- v4.1 : routage tampon / urgent
+    BATCHED = {"trade_open", "trade_close", "setup", "target"}
+
     def send(self, payload, key=None, force=False):
+        typ = payload.get("type", "alert")
+        if typ in URGENT_TYPES:
+            item = {"ts": now_iso(), "key": key, **payload}
+            if URGENT_COALESCE and typ != "kill_switch":
+                buf = self.db.get("urgent_buf", []) or []
+                buf.append(item); self.db.set("urgent_buf", buf)
+                log.warning("urgence en file (envoi groupé à la minute): %s %s", typ, payload.get("why"))
+                return True
+            buf = (self.db.get("urgent_buf", []) or []) + [item]
+            self.db.set("urgent_buf", [])
+            return self._send_urgent(buf)
+        if WEBHOOK_BATCH and typ in self.BATCHED:
+            buf = self.db.get("batch_buf", []) or []
+            buf.append({"ts": now_iso(), "key": key, **payload}); self.db.set("batch_buf", buf[-300:])
+            self.db.x("INSERT INTO alerts(ts,type,key,payload,sent,suppressed_reason) VALUES(?,?,?,?,0,?)",
+                      (now_iso(), typ, key, json.dumps(payload, default=str), "batch"))
+            log.info("événement mis en tampon (récap %sh): %s %s", BATCH_HOURS, typ, key)
+            return True
+        return self.send_now(payload, key, force)
+
+    @staticmethod
+    def _code(lines):
+        return "```\n" + "\n".join(lines) + "\n```"
+
+    def _send_urgent(self, items):
+        if not items:
+            return True
+        lines = ["URGENT trading-v4 %s (%s)" % (SYMBOL, "LIVE" if REAL_ORDERS else "PAPER")]
+        for it in items:
+            lines.append("%s %-11s %s" % (it["ts"][11:19], it.get("type"), it.get("why") or ""))
+            if it.get("equity") is not None:
+                lines.append("         equity %s  prix %s  pos %s" % (it.get("equity"), it.get("price"), it.get("open_positions")))
+        text = self._code(lines)
+        if len(items) == 1:
+            p = {k: v for k, v in items[0].items() if k not in ("ts", "key")}
+            p["text"] = text; p["urgent"] = True
+            return self.send_now(p, items[0].get("key"), force=True)
+        return self.send_now({"type": "urgent_batch", "urgent": True, "items": items, "text": text,
+                              "why": "; ".join(f"{i.get('type')}: {i.get('why')}" for i in items)[:500]},
+                             "urgent_batch", force=True)
+
+    def tick(self, eng):
+        """Appelé à chaque boucle : vide les urgences (minute écoulée) et le récap périodique."""
+        buf = self.db.get("urgent_buf", []) or []
+        if buf:
+            first = buf[0]["ts"][:16]
+            if not URGENT_COALESCE or now_iso()[:16] != first:
+                self.db.set("urgent_buf", [])
+                self._send_urgent(buf)
+        if not WEBHOOK_BATCH:
+            return
+        bucket = int(time.time() // max(BATCH_HOURS * 3600, 60))
+        last = self.db.get("batch_bucket")
+        if last is None:
+            self.db.set("batch_bucket", bucket); return
+        if bucket == last:
+            return
+        self.db.set("batch_bucket", bucket)
+        items = self.db.get("batch_buf", []) or []
+        if not items and not BATCH_SEND_EMPTY:
+            return
+        self.db.set("batch_buf", [])
+        self.send_now(eng.batch_payload(items), "batch", force=True)
+
+    def send_now(self, payload, key=None, force=False):
         typ = payload.get("type", "alert")
         payload = {"source": "trading-v4", "symbol": SYMBOL, "ts": now_iso(),
                    "mode": "LIVE" if REAL_ORDERS else "PAPER", **payload}
@@ -510,6 +638,73 @@ class Engine:
 
     def paused_until(self):
         return self.db.get("paused_until", 0)
+
+    # -- v4.1 alertes urgentes (dédupliquées)
+    def urgent(self, typ, why, key=None, **extra):
+        k = key or f"{typ}:{str(why)[:60]}"
+        last = self.db.get("urgent_last", {}) or {}
+        t = time.time()
+        if t - float(last.get(k, 0)) < URGENT_ERR_COOLDOWN_MIN * 60:
+            log.warning("urgence déjà signalée (cooldown) %s: %s", k, why); return
+        last = {kk: v for kk, v in last.items() if t - float(v) < 86400}
+        last[k] = t; self.db.set("urgent_last", last)
+        eq = self.db.get("live_equity") if REAL_ORDERS else self.db.get("paper_equity")
+        try:
+            n_open = len(self.open_trades())
+        except Exception:
+            n_open = None
+        self.alert.send({"type": typ, "why": str(why)[:400], "price": self.price,
+                         "equity": round(eq, 2) if isinstance(eq, (int, float)) else eq,
+                         "open_positions": n_open, **extra}, key=k, force=True)
+
+    def batch_payload(self, items):
+        st = self.stats()
+        opens = [i for i in items if i.get("type") == "trade_open"]
+        closes = [i for i in items if i.get("type") == "trade_close"]
+        setups = [i for i in items if i.get("type") == "setup"]
+        pnl = round(sum(float(i.get("pnl") or 0) for i in closes), 4)
+        L = [f"RECAP {BATCH_HOURS:g}h trading-v4 {SYMBOL} {self.mode}  {now_iso()[:16]}Z",
+             f"equity {st['equity']}  pnl période {pnl:+}  pnl jour {st['pnl_today']:+}  pnl total {st['pnl_total']:+}",
+             f"ouverts {len(opens)}  fermés {len(closes)}  setups {len(setups)}  positions {len(st['open'])}", ""]
+        for i in items:
+            ts = (i.get("ts") or "")[11:16]
+            if i.get("type") == "trade_open":
+                L.append(f"{ts} OPEN  #{i.get('trade_id')} {i.get('timeframe'):>3} {i.get('side'):<5} {i.get('setup')} "
+                         f"@{i.get('price')} sl {i.get('sl')} tp {i.get('tp')} q {i.get('qty')}")
+            elif i.get("type") == "trade_close":
+                L.append(f"{ts} CLOSE #{i.get('trade_id')} {i.get('timeframe'):>3} {i.get('side'):<5} "
+                         f"{i.get('entry')}->{i.get('price')} pnl {float(i.get('pnl') or 0):+.4f} ({i.get('reason')})")
+            elif i.get("type") == "setup":
+                L.append(f"{ts} SETUP {i.get('timeframe')} {i.get('setup')} {i.get('side')} conf {i.get('confidence')} "
+                         f"({i.get('skip_reason') or i.get('action')})")
+            else:
+                L.append(f"{ts} {str(i.get('type')).upper()} {i.get('why') or ''}")
+        if st["open"]:
+            L += ["", "positions ouvertes :"] + [f"  #{o['id']} {o['timeframe']} {o['side']} @{o['entry']} sl {o['sl']} tp {o['tp']} q {o['qty']}"
+                                                 for o in st["open"]]
+        text = Alerter._code(L)
+        return {"type": "batch_summary", "equity": st["equity"], "price": self.price, "open_positions": len(st["open"]),
+                "pnl_period": pnl, "trades_opened": len(opens), "trades_closed": len(closes), "text": text,
+                "why": f"récap {BATCH_HOURS:g}h : {len(opens)} ouverts, {len(closes)} fermés, pnl {pnl:+}",
+                "events": items[-60:]}
+
+    def digest_text(self, st):
+        L = [f"DIGEST quotidien trading-v4 {SYMBOL} {self.mode}  {now_iso()[:16]}Z",
+             f"equity {st['equity']} (départ {st['start']})  halted {st['halted'] or 'non'}  pause {st['paused']}",
+             f"trades total {st['trades']}  gagnants {st['wins']}  pnl total {st['pnl_total']:+}",
+             f"aujourd'hui (UTC) : {st['trades_today']} trades  pnl {st['pnl_today']:+}  signaux {st['signals_today']}",
+             f"prix {st['price']}  funding {st['funding_pct']}%", "", "contexte :"]
+        for tf, a in self.ctx.items():
+            L.append(f"  {tf:>3} trend {a['trend']:+d}  rsi {a['rsi'] or 0:5.1f}  adx {a.get('adx') or 0:5.1f}  atr {a['atr'] or 0:.1f}")
+        if st["open"]:
+            L += ["", "positions :"] + [f"  #{o['id']} {o['timeframe']} {o['side']} @{o['entry']} sl {o['sl']} tp {o['tp']} q {o['qty']}"
+                                        for o in st["open"]]
+        rows = self.db.q("SELECT id,timeframe,setup,side,entry,exit,pnl,close_reason FROM trades WHERE mode=? "
+                         "AND status='CLOSED' ORDER BY id DESC LIMIT 8", (self.mode,))
+        if rows:
+            L += ["", "derniers trades :"] + [f"  #{r['id']} {r['timeframe']} {r['side']} {r['entry']}->{r['exit']} "
+                                              f"{(r['pnl'] or 0):+.4f} {r['close_reason']}" for r in rows]
+        return Alerter._code(L)
 
     # -- market data
     def fetch(self, tf):
@@ -706,19 +901,32 @@ class Engine:
                     "orderType": "MARKET", "qty": fmt(p["qty"], self.qty_prec), "clientId": cid,
                     "slPrice": fmt(p["sl"], self.px_prec), "slStopType": "MARK_PRICE", "slOrderType": "MARKET",
                     "tpPrice": fmt(p["tp"], self.px_prec), "tpStopType": "MARK_PRICE", "tpOrderType": "MARKET"}
-            self.db.ev("order_send", body)
-            try:
-                self.api.place_order(body)
-            except BitunixError as e:
-                self.db.ev("order_rejected", {"err": str(e)}, level="ERROR")
-                return False
-            except Exception as e:
-                self.db.ev("order_unknown", {"err": str(e), "clientId": cid}, level="ERROR")
-                # on ne renvoie jamais : vérification via clientId
-                try:
-                    self.api.order_detail(cid)
-                except Exception:
+            if TP_LIMIT:
+                body["tpOrderType"], body["tpOrderPrice"] = "LIMIT", fmt(p["tp"], self.px_prec)
+            limit_px = None
+            if ENTRY_POST_ONLY:
+                r = self._entry_limit(body, side, p, cid)
+                if r is None:
                     return False
+                limit_px, filled = r
+                if filled + 1e-12 < p["qty"]:
+                    p = dict(p, qty=filled, margin=round(filled * limit_px / LEVERAGE, 3))
+            else:
+                self.db.ev("order_send", body)
+                try:
+                    self.api.place_order(body)
+                except BitunixError as e:
+                    self.db.ev("order_rejected", {"err": str(e)}, level="ERROR")
+                    self.urgent("order_error", f"ordre refusé: {e}", key=f"ord:{getattr(e, 'code', '')}")
+                    return False
+                except Exception as e:
+                    self.db.ev("order_unknown", {"err": str(e), "clientId": cid}, level="ERROR")
+                    # on ne renvoie jamais : vérification via clientId
+                    try:
+                        self.api.order_detail(cid)
+                    except Exception:
+                        self.urgent("order_error", f"ordre au statut inconnu {cid}: {e}", key=f"ordunk:{cid}")
+                        return False
             time.sleep(1.5)
             try:
                 for ps in self.api.positions(SYMBOL):
@@ -733,18 +941,104 @@ class Engine:
                                 entry = round(fill, 1)
             except Exception as e:
                 log.warning("positions(): %s", e)
+            if limit_px:
+                entry = round(limit_px, self.px_prec)   # post-only : rempli exactement au prix limite
         tid = self.db.x("INSERT INTO trades(mode,opened_ts,timeframe,setup,side,entry,qty,leverage,margin,sl,tp,"
                         "risk_usdt,status,client_id,position_id,signal_id,confidence,max_hold_h) "
                         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'OPEN',?,?,?,?,?)",
                         (mode, now_iso(), tf, s["setup"], side, entry, p["qty"], LEVERAGE, p["margin"], p["sl"],
                          p["tp"], p["risk_usdt"], cid, pos_id, sid, s["confidence"],
                          TF_MAX_HOLD_H.get(tf, 24))).lastrowid
+        if REAL_ORDERS:
+            self.verify_entry_tpsl(tid, partial=bool(limit_px) and p["qty"] + 1e-12 < float(body["qty"]))
         self.alert.send({"type": "trade_open", "timeframe": tf, "setup": s["setup"], "side": side,
                          "price": entry, "sl": p["sl"], "tp": p["tp"], "confidence": s["confidence"],
                          "qty": p["qty"], "margin": p["margin"], "risk_usdt": p["risk_usdt"], "why": s["why"],
                          "trade_id": tid, "equity": round(self.equity(), 2),
                          "open_positions": len(self.open_trades())}, key=f"open:{tid}")
         return True
+
+    def _entry_limit(self, body, side, p, cid):
+        """v4.1 : entrée limite post-only au meilleur prix ; annulée (jamais chassée) après ENTRY_TIMEOUT_SEC.
+        Retourne (prix, qty remplie) ou None."""
+        try:
+            d = self.api.depth(SYMBOL, 1)
+            bid, ask = float(d["bids"][0][0]), float(d["asks"][0][0])
+        except Exception as e:
+            self.urgent("api_error", f"depth() pour entrée limite: {e}", key="depth"); return None
+        px = round(bid if side == "LONG" else ask, self.px_prec)
+        if not ((side == "LONG" and p["sl"] < px < p["tp"]) or (side == "SHORT" and p["tp"] < px < p["sl"])):
+            self.db.ev("entry_skip", {"why": "prix limite hors sl/tp", "px": px, "sl": p["sl"], "tp": p["tp"]}, level="WARNING")
+            return None
+        body.update({"orderType": "LIMIT", "price": fmt(px, self.px_prec),
+                     "effect": "POST_ONLY" if POST_ONLY_SUPPORTED else "GTC"})
+        self.db.ev("order_send", body)
+        try:
+            self.api.place_order(body)
+        except BitunixError as e:
+            self.db.ev("order_rejected", {"err": str(e)}, level="ERROR")
+            if "post" in str(e).lower():   # post-only qui aurait croisé : normal, pas de chasse
+                self.db.ev("entry_postonly_rejected", {"err": str(e)}, level="WARNING"); return None
+            self.urgent("order_error", f"ordre limite refusé: {e}", key=f"ord:{getattr(e, 'code', '')}")
+            return None
+        except Exception as e:
+            self.db.ev("order_unknown", {"err": str(e), "clientId": cid}, level="ERROR")
+        status, tq, det = None, 0.0, {}
+        deadline = time.time() + ENTRY_TIMEOUT_SEC
+        while time.time() < deadline:
+            time.sleep(2)
+            try:
+                det = self.api.order_detail(cid) or {}
+                status, tq = str(det.get("status") or "").upper().strip("_"), float(det.get("tradeQty") or 0)
+            except Exception as e:
+                log.warning("order_detail %s: %s", cid, e); continue
+            if status in ("FILLED", "CANCELED", "CANCELLED"):
+                break
+        if status != "FILLED":
+            if status not in ("CANCELED", "CANCELLED"):
+                try:
+                    r = self.api.cancel_orders(SYMBOL, client_ids=[cid])
+                    if (r or {}).get("failureList"):
+                        log.warning("cancel %s: %s", cid, r.get("failureList"))
+                except Exception as e:
+                    log.warning("cancel_orders %s: %s", cid, e)
+                time.sleep(1.0)
+            try:
+                det = self.api.order_detail(cid) or {}
+                status, tq = str(det.get("status") or "").upper().strip("_"), float(det.get("tradeQty") or 0)
+            except Exception as e:
+                self.urgent("order_error", f"ordre limite {cid} : statut illisible après annulation ({e})", key=f"ordunk:{cid}")
+                return None
+            if status in ("NEW", "INIT", "PART_FILLED"):
+                self.urgent("order_error", f"ordre limite {cid} non annulé (statut {status})", key=f"ordunk:{cid}")
+        tq = round_down(tq, self.qty_prec)
+        if tq < self.min_qty:
+            self.db.ev("entry_unfilled", {"clientId": cid, "px": px, "status": status, "timeout_s": ENTRY_TIMEOUT_SEC})
+            return None
+        if status != "FILLED":
+            self.db.ev("entry_partial", {"clientId": cid, "filled": tq, "qty": body["qty"]}, level="WARNING")
+        try:
+            px = float(det.get("avgPrice") or det.get("price") or px)
+        except (TypeError, ValueError):
+            pass
+        return px, tq
+
+    def verify_entry_tpsl(self, tid, partial=False):
+        """Après ouverture : le trade doit avoir SON SL (et TP) sur Bitunix ; sinon on les pose."""
+        t = self.db.q("SELECT * FROM trades WHERE id=?", (tid,))[0]
+        if not t["position_id"]:
+            self.urgent("no_sl", f"#{tid} position introuvable après ouverture : SL non vérifiable", key=f"nosl:{tid}"); return
+        try:
+            mine = self.own_tpsl(t, self.api.tpsl_pending(SYMBOL))
+        except Exception as e:
+            log.warning("verify tpsl_pending: %s", e); return
+        if partial and mine:   # TP/SL attachés à la qty demandée -> ramener à la qty remplie
+            for o in mine:
+                try: self.api.tpsl_cancel(o.get("id"))
+                except Exception as e: log.warning("tpsl_cancel %s: %s", o.get("id"), e)
+            time.sleep(0.5); mine = []
+        if not any(o.get("slPrice") for o in mine):
+            self.replace_tpsl(t)
 
     @staticmethod
     def own_tpsl(t, orders):
@@ -757,6 +1051,26 @@ class Engine:
             if (sl and t["sl"] and abs(float(sl) - t["sl"]) < 0.06) or (tp and t["tp"] and abs(float(tp) - t["tp"]) < 0.06):
                 out.append(o)
         return out
+
+    def _tp_limit_unfilled(self, t, live_pos):
+        """TP limite déclenché mais pas rempli ? (position pas réduite de la qty du trade) -> sécurise."""
+        pid = str(t["position_id"])
+        expected = sum(o["qty"] for o in self.open_trades() if str(o["position_id"]) == pid)
+        actual = live_pos.get(pid, 0.0)
+        if actual < expected - 0.5 * t["qty"]:
+            return False   # la position a bien été réduite : TP exécuté
+        log.error("#%s : TP/SL disparus mais position non réduite (%.4f >= %.4f) -> TP limite non rempli ?",
+                  t["id"], actual, expected)
+        try:   # annule les ordres limite de clôture restants de ce trade (prix du TP)
+            ids = [o.get("orderId") for o in self.api.pending_orders(SYMBOL)
+                   if str(o.get("positionId")) == pid and o.get("price") and abs(float(o["price"]) - t["tp"]) < 0.06]
+            if ids:
+                self.api.cancel_orders(SYMBOL, order_ids=ids); time.sleep(0.5)
+        except Exception as e:
+            log.warning("pending_orders/cancel: %s", e)
+        self.urgent("no_sl", f"#{t['id']} TP limite déclenché non rempli : SL absent -> re-pose/fermeture", key=f"nosl:{t['id']}")
+        self.replace_tpsl(t)
+        return True
 
     def close_live(self, t):
         """Ferme uniquement la part de CE trade si la position exchange est partagée.
@@ -810,12 +1124,14 @@ class Engine:
                 self.close_trade(t, px, "TP/SL annulés par Bitunix, fermé au marché")
             except Exception as e:
                 log.error("close_qty #%s: %s", t["id"], e)
+                self.urgent("no_sl", f"#{t['id']} TP/SL annulés et fermeture au marché échouée: {e}", key=f"nosl:{t['id']}")
             return
         try:
             self.api.tpsl_place(t["position_id"], t["qty"], t["sl"], t["tp"], self.qty_prec, self.px_prec)
             self.db.ev("tpsl_replaced", {"trade": t["id"], "sl": t["sl"], "tp": t["tp"], "qty": t["qty"]}, level="WARNING")
         except Exception as e:
             log.error("tpsl_place #%s: %s", t["id"], e)
+            self.urgent("no_sl", f"#{t['id']} re-pose TP/SL échouée ({e}) : trade sans SL", key=f"nosl:{t['id']}")
 
     def _tpsl_canceled(self, t):
         """True si les TP/SL du trade ont été ANNULÉS (pas exécutés) -> on les re-pose, trade reste ouvert."""
@@ -841,7 +1157,9 @@ class Engine:
         tpsl = None
         if REAL_ORDERS and self.open_trades():
             try:
-                live_pos = {str(p.get("positionId")) for p in self.api.positions(SYMBOL)}
+                live_pos = {}
+                for ps in self.api.positions(SYMBOL):
+                    live_pos[str(ps.get("positionId"))] = live_pos.get(str(ps.get("positionId")), 0.0) + float(ps.get("qty") or 0)
             except Exception as e:
                 log.warning("positions(): %s", e)
             try:
@@ -861,7 +1179,14 @@ class Engine:
                         not self._tpsl_canceled(t):
                     # ses propres TP/SL ont disparu -> exécutés (position fusionnée toujours ouverte)
                     hit_sl = abs(self.price - t["sl"]) <= abs(self.price - t["tp"])
+                    if not hit_sl and TP_LIMIT and self._tp_limit_unfilled(t, live_pos):
+                        continue
                     exit_px, reason = (t["sl"], "SL propre exécuté") if hit_sl else (t["tp"], "TP propre exécuté")
+                elif tpsl is not None and live_pos is not None and t["position_id"] and \
+                        time.time() * 1000 - opened_ms > 90000:
+                    mine = self.own_tpsl(t, tpsl)
+                    if mine and not any(o.get("slPrice") and abs(float(o["slPrice"]) - t["sl"]) < 0.06 for o in mine):
+                        self.urgent("no_sl", f"#{t['id']} {t['side']} sans SL sur Bitunix (TP seul présent)", key=f"nosl:{t['id']}")
             else:
                 if t["side"] == "LONG":
                     if lo <= t["sl"]: exit_px, reason = t["sl"], "SL"
@@ -916,6 +1241,10 @@ class Engine:
                              "open_positions": len(self.open_trades()), "why": "objectif atteint"}, force=True)
         d0 = self.day_start_equity()
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if URGENT_DD_PCT > 0 and d0 and (d0 - eq) / d0 * 100 > URGENT_DD_PCT and self.db.get("dd_alert_day") != day:
+            self.db.set("dd_alert_day", day)
+            self.urgent("drawdown", f"drawdown du jour {(d0 - eq) / d0 * 100:.1f}% > {URGENT_DD_PCT}% "
+                                    f"(début {d0:.2f} -> {eq:.2f})", key=f"dd:{day}")
         if d0 and (d0 - eq) / d0 * 100 >= DAILY_STOP_PCT and self.db.get("daily_stop_sent") != day:
             self.db.set("daily_stop_sent", day)
             self.alert.send({"type": "risk", "equity": round(eq, 2), "price": self.price,
@@ -943,6 +1272,11 @@ class Engine:
         if h.hour in DIGEST_HOURS_UTC and self.db.get("last_digest") != key:
             self.db.set("last_digest", key)
             st = self.stats()
+            if DIGEST_TEXT:
+                self.alert.send({"type": "digest", "format": "text", "text": self.digest_text(st),
+                                 "equity": st["equity"], "price": self.price, "open_positions": len(st["open"])},
+                                force=True)
+                return
             self.alert.send({"type": "digest", "timeframe": "all", "setup": None, "price": self.price, "sl": None,
                              "tp": None, "confidence": None, "equity": st["equity"],
                              "open_positions": len(st["open"]), "stats": st, "ctx": self.ctx_summary(),
@@ -970,6 +1304,7 @@ class Engine:
         self.manage()
         self.check_global()
         self.digest()
+        self.alert.tick(self)
         self.db.set("heartbeat", {"ts": now_iso(), "price": self.price, "equity": round(self.equity(), 3)})
 
     def run(self, once=False):
@@ -988,6 +1323,8 @@ class Engine:
                 self.step()
             except Exception as e:
                 log.exception("step: %s", e)
+                try: self.urgent("api_error", f"step: {e}", key=f"step:{type(e).__name__}")
+                except Exception: log.exception("urgent()")
             if once:
                 break
             time.sleep(max(1, POLL_SEC - (time.time() - t0)))
