@@ -2,6 +2,21 @@
 
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/). Dates en UTC+8.
 
+## [v4.2] — 2026-10-23
+### Ajouté
+- **Sorties** : TP à 1,5R (`RR=1.5`) ; clôture partielle de 50 % à 1R (`PARTIAL_TP`, `PARTIAL_R`, `PARTIAL_FRAC`) par ordre limite posé à l'ouverture (`PARTIAL_LIMIT`, repli au marché) ; ensuite SL au break-even + frais (`BE_AFTER_PARTIAL`, `BE_FEE_PCT=0.10`). Positions fusionnées (hedge) : partielle par qty sur le `positionId`, puis remplacement des TP/SL du trade pour la qty restante et réparation de ceux des autres trades.
+- **Filtre ATR %** par TF (`ATR_FILTER`, `ATR_MIN_PCT=5m:0.090,15m:0.165,1h:0.37,4h:0.90,1d:2.6`), calibré sur l'historique récent (22e centile des bougies).
+- **Breakout 5m strict** (`BREAKOUT5M_STRICT`, `BREAKOUT5M_VOL_MULT=2.0`) : volume ≥ 2× la moyenne 20 + clôture au-delà du niveau dans le sens de la bougie.
+- **VWAP/OBV** (`VWAP_OBV=boost`) : +0,03 de confiance si VWAP de session et pente OBV confirment, −0,03 si les deux contredisent (le filtre dur retirait 36 % des signaux au backtest, > 40 % en 15m/4h, et dégradait le 5m).
+- **Kronos 1h** (`KRONOS_FILTER`) : lecture seule de `predictions.db`, actif seulement si précision 1h ≥ 55 % sur ≥ 50 prédictions vérifiées ; toute erreur est ignorée.
+- **Auto-kill setup×TF** (`AUTO_KILL`) : 3 jours, n ≥ 8, PnL < 0 et WR < 40 % → paper (table `shadow_trades`), réactivation si le paper est positif sur 3 jours ; événement `autokill` dans le récap groupé.
+- Les rejets ADX / ATR / volume / Kronos sont journalisés dans `signals.skip_reason` (`filtre: …`).
+- `MAX_PER_TF` (2 en production) : positions simultanées par timeframe.
+### Modifié
+- `RISK_PCT` 33 → 12 (le plafond `MAX_MARGIN_PCT=25` reste).
+- `MAX_FEE_SHARE` 0,30 → 0,20 ; frais estimés maker à l'entrée post-only (`MAKER_FEE_RATE=0.0002`) + taker à la sortie (`FEE_MODEL_MAKER`).
+- Migration douce de `trades` (colonnes `init_sl`, `partial_*`) ; les trades ouverts avant v4.2 gardent leur gestion (pas de partielle).
+
 ## [v4.1.2] — 2026-10-23
 ### Ajouté
 - `review.py` : revue de performance 3 jours sans tokens (lecture seule), rapport Markdown FR avec verdicts par setup×TF et recommandations.

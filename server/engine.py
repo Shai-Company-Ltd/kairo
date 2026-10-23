@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Moteur trading v4.1 — BTCUSDT Bitunix USDT-M, isolé, hedge, multi-timeframes.
+"""Moteur trading v4.2 — BTCUSDT Bitunix USDT-M, isolé, hedge, multi-timeframes.
+
+v4.2 : TP 1.5R + clôture partielle 50 % à 1R (limite) puis SL au break-even + frais,
+frais estimés maker/taker (MAX_FEE_SHARE 0.20), RISK_PCT 12, 2 positions par TF,
+breakout 5m strict (vol x2), filtre ATR% par TF, confirmation VWAP/OBV, filtre Kronos 1h
+(auto-activé si fiable), auto-kill setup x TF -> paper (shadow) puis réactivation.
+Chaque nouveauté est désactivable dans .env (voir bloc v4.2).
 
 v4.1 : webhooks groupés (récap 3 h), urgences immédiates (regroupées à la minute),
 digest texte 1x/jour, 1m hors trading, filtre ADX, entrée limite post-only 20 s, TP limite.
@@ -64,7 +70,7 @@ KILL_EQUITY = E("KILL_EQUITY", 12.0, float)       # equity <= -> HALT total
 TARGET_EQUITY = E("TARGET_EQUITY", 100.0, float)
 MAX_CONSEC_LOSSES = E("MAX_CONSEC_LOSSES", 3, int)
 PAUSE_AFTER_LOSSES_MIN = E("PAUSE_AFTER_LOSSES_MIN", 120, int)
-RR = E("RR", 2.0, float)
+RR = E("RR", 1.5, float)                          # v4.2 : TP à 1.5R (était 2.0)
 ATR_SL_MULT = E("ATR_SL_MULT", 1.5, float)
 MIN_SL_PCT = E("MIN_SL_PCT", 0.25, float)         # SL mini en % du prix (anti-bruit + frais)
 FEE_RATE = E("FEE_RATE", 0.0006, float)           # taker par côté
@@ -101,6 +107,34 @@ ENTRY_POST_ONLY = E("ENTRY_POST_ONLY", True, bool)      # entrée limite post-on
 POST_ONLY_SUPPORTED = E("POST_ONLY_SUPPORTED", True, bool)  # 0 -> limite GTC simple au meilleur prix
 ENTRY_TIMEOUT_SEC = E("ENTRY_TIMEOUT_SEC", 20, int)     # non rempli -> annulé, jamais chassé
 TP_LIMIT = E("TP_LIMIT", True, bool)                    # TP en ordre limite (SL toujours au marché)
+# ---------- v4.2 (chaque nouveauté désactivable)
+MAKER_FEE_RATE = E("MAKER_FEE_RATE", 0.0002, float)    # frais maker (entrée post-only)
+FEE_MODEL_MAKER = E("FEE_MODEL_MAKER", True, bool)     # 1 = entrée maker si post-only, sortie taker (pire cas SL)
+PARTIAL_TP = E("PARTIAL_TP", True, bool)               # clôture partielle à PARTIAL_R
+PARTIAL_R = E("PARTIAL_R", 1.0, float)
+PARTIAL_FRAC = E("PARTIAL_FRAC", 0.5, float)
+PARTIAL_LIMIT = E("PARTIAL_LIMIT", True, bool)         # partielle = ordre limite de clôture posé à l'ouverture
+BE_AFTER_PARTIAL = E("BE_AFTER_PARTIAL", True, bool)   # SL -> break-even + frais après la partielle
+BE_FEE_PCT = E("BE_FEE_PCT", 0.10, float)              # marge BE en % du prix (couvre frais A/R ~0.08 %)
+MAX_PER_TF = E("MAX_PER_TF", 1, int)                   # positions simultanées max par timeframe
+BREAKOUT_VOL_MULT = E("BREAKOUT_VOL_MULT", 1.5, float)
+BREAKOUT5M_STRICT = E("BREAKOUT5M_STRICT", True, bool) # 5m : vol >= BREAKOUT5M_VOL_MULT x moy20 + clôture au-delà
+BREAKOUT5M_VOL_MULT = E("BREAKOUT5M_VOL_MULT", 2.0, float)
+ATR_FILTER = E("ATR_FILTER", True, bool)               # marché plat (ATR% < seuil du TF) -> pas de trade
+ATR_MIN_PCT = {k.strip(): float(v) for k, v in (x.split(":") for x in
+               E("ATR_MIN_PCT", "5m:0.090,15m:0.165,1h:0.37,4h:0.90,1d:2.6").split(",") if ":" in x)}
+VWAP_OBV = E("VWAP_OBV", "boost").strip().lower()      # off | filter | boost (bonus/malus de confiance)
+VWAP_OBV_BONUS = E("VWAP_OBV_BONUS", 0.03, float)
+OBV_SLOPE_BARS = E("OBV_SLOPE_BARS", 10, int)
+KRONOS_FILTER = E("KRONOS_FILTER", True, bool)         # 1h : actif seulement si précision >= KRONOS_MIN_ACC
+KRONOS_DB = E("KRONOS_DB", "/opt/kronos/predictions.db")
+KRONOS_MIN_ACC = E("KRONOS_MIN_ACC", 0.55, float)
+KRONOS_MIN_N = E("KRONOS_MIN_N", 50, int)
+KRONOS_MAX_AGE_H = E("KRONOS_MAX_AGE_H", 2.0, float)
+AUTO_KILL = E("AUTO_KILL", True, bool)                 # setup x TF perdant -> paper (shadow) puis réactivation
+AUTO_KILL_DAYS = E("AUTO_KILL_DAYS", 3.0, float)
+AUTO_KILL_MIN_N = E("AUTO_KILL_MIN_N", 8, int)
+AUTO_KILL_MAX_WR = E("AUTO_KILL_MAX_WR", 0.40, float)
 URGENT_TYPES = {"kill_switch", "risk", "api_error", "order_error", "no_sl", "drawdown"}
 
 TF_SEC = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400}
@@ -312,6 +346,18 @@ def session_vwap(c):
     seg = [x for x in c if x["t"] >= day0]
     return vwap(seg) if seg else None
 
+def obv_slope(c, n=10):
+    """Pente OBV : OBV[-1] - OBV[-1-n], normalisée par le volume moyen (>0 = acheteurs)."""
+    if len(c) < n + 2:
+        return None
+    obv, o = [0.0], 0.0
+    for i in range(1, len(c)):
+        d = c[i]["c"] - c[i - 1]["c"]
+        o += c[i]["v"] if d > 0 else -c[i]["v"] if d < 0 else 0.0
+        obv.append(o)
+    vavg = sum(x["v"] for x in c[-n:]) / n or 1.0
+    return (obv[-1] - obv[-1 - n]) / vavg
+
 def analyse(c, tf="1h"):
     """c = bougies CLÔTURÉES, ordre chronologique."""
     cl = [x["c"] for x in c]
@@ -334,7 +380,9 @@ def analyse(c, tf="1h"):
             "vwap": session_vwap(c) if TF_SEC.get(tf, 0) <= 3600 else None,
             "vwap50": vwap(c, 50), "vol": last["v"], "vol_avg": vavg,
             "vol_ratio": (last["v"] / vavg) if vavg else None,
-            "hi20": hi20, "lo20": lo20, "trend": trend}
+            "hi20": hi20, "lo20": lo20, "trend": trend,
+            "atr_pct": (atr(c) or 0) / last["c"] * 100 if last["c"] else None,
+            "obv_slope": obv_slope(c, OBV_SLOPE_BARS)}
 
 # ---------------------------------------------------------------- setups
 def detect(tf, a, ctx):
@@ -355,34 +403,75 @@ def detect(tf, a, ctx):
             c += 0.03 if (px - a["vwap"]) * side > 0 else -0.03
         return round(max(0.0, min(0.95, c)), 2)
 
-    trend_ok = (not ADX_FILTER) or (a.get("adx") is not None and a["adx"] > ADX_MIN)
-    # 1) cassure du range 20 bougies avec volume (v4.1 : seulement si ADX > ADX_MIN)
-    if trend_ok and a["hi20"] and px > a["hi20"] and vr >= 1.5 and a["trend"] >= 0:
-        out.append({"setup": "breakout", "side": "LONG", "confidence": conf(0.55, 1),
-                    "why": f"close>{a['hi20']:.1f} (haut 20), vol x{vr:.1f}"})
-    if trend_ok and a["lo20"] and px < a["lo20"] and vr >= 1.5 and a["trend"] <= 0:
-        out.append({"setup": "breakout", "side": "SHORT", "confidence": conf(0.55, -1),
-                    "why": f"close<{a['lo20']:.1f} (bas 20), vol x{vr:.1f}"})
+    # v4.2 : les setups filtrés (ADX, ATR%, volume breakout 5m) sont RETOURNÉS avec "filtered"
+    # -> journalisés dans signals.skip_reason (comptables), jamais tradés ni alertés.
+    adx_skip = None
+    if ADX_FILTER and not (a.get("adx") is not None and a["adx"] > ADX_MIN):
+        adx_skip = f"adx {a['adx'] if a.get('adx') is not None else float('nan'):.1f} <= {ADX_MIN:g}"
+    atr_skip = None
+    thr = ATR_MIN_PCT.get(tf)
+    if ATR_FILTER and thr and a.get("atr_pct") is not None and a["atr_pct"] < thr:
+        atr_skip = f"atr% {a['atr_pct']:.3f} < {thr:g} ({tf} plat)"
+    strict5 = BREAKOUT5M_STRICT and tf == "5m"
+    bvol = BREAKOUT5M_VOL_MULT if strict5 else BREAKOUT_VOL_MULT
+    def add(d, trend_gate=True):
+        f = (adx_skip if trend_gate else None) or atr_skip
+        if f and not d.get("filtered"):
+            d["filtered"] = f
+        out.append(d)
+    # 1) cassure du range 20 bougies avec volume (ADX > ADX_MIN ; 5m : vol x2 + clôture au-delà, bougie dans le sens)
+    if a["hi20"] and px > a["hi20"] and vr >= 1.5 and a["trend"] >= 0:
+        d = {"setup": "breakout", "side": "LONG", "confidence": conf(0.55, 1),
+             "why": f"close>{a['hi20']:.1f} (haut 20), vol x{vr:.1f}"}
+        if vr < bvol:
+            d["filtered"] = f"breakout vol x{vr:.1f} < {bvol:g}" + (" (5m)" if strict5 else "")
+        elif strict5 and not px > a["open"]:
+            d["filtered"] = "breakout 5m : bougie non haussière"
+        add(d)
+    if a["lo20"] and px < a["lo20"] and vr >= 1.5 and a["trend"] <= 0:
+        d = {"setup": "breakout", "side": "SHORT", "confidence": conf(0.55, -1),
+             "why": f"close<{a['lo20']:.1f} (bas 20), vol x{vr:.1f}"}
+        if vr < bvol:
+            d["filtered"] = f"breakout vol x{vr:.1f} < {bvol:g}" + (" (5m)" if strict5 else "")
+        elif strict5 and not px < a["open"]:
+            d["filtered"] = "breakout 5m : bougie non baissière"
+        add(d)
     # 2) pullback sur EMA20 dans la tendance
-    if trend_ok and a["trend"] == 1 and a["low"] <= a["ema20"] < px and 40 <= a["rsi"] <= 60 and px > a["open"]:
-        out.append({"setup": "pullback_ema20", "side": "LONG", "confidence": conf(0.52, 1),
-                    "why": f"tendance haussière, rebond EMA20 {a['ema20']:.1f}, RSI {a['rsi']:.0f}"})
-    if trend_ok and a["trend"] == -1 and a["high"] >= a["ema20"] > px and 40 <= a["rsi"] <= 60 and px < a["open"]:
-        out.append({"setup": "pullback_ema20", "side": "SHORT", "confidence": conf(0.52, -1),
-                    "why": f"tendance baissière, rejet EMA20 {a['ema20']:.1f}, RSI {a['rsi']:.0f}"})
+    if a["trend"] == 1 and a["low"] <= a["ema20"] < px and 40 <= a["rsi"] <= 60 and px > a["open"]:
+        add({"setup": "pullback_ema20", "side": "LONG", "confidence": conf(0.52, 1),
+             "why": f"tendance haussière, rebond EMA20 {a['ema20']:.1f}, RSI {a['rsi']:.0f}"})
+    if a["trend"] == -1 and a["high"] >= a["ema20"] > px and 40 <= a["rsi"] <= 60 and px < a["open"]:
+        add({"setup": "pullback_ema20", "side": "SHORT", "confidence": conf(0.52, -1),
+             "why": f"tendance baissière, rejet EMA20 {a['ema20']:.1f}, RSI {a['rsi']:.0f}"})
     # 3) excès RSI + spike de volume + bougie de retournement (contre-tendance, confiance plus basse)
     if a["rsi_prev"] is not None:
         if a["rsi_prev"] < 25 and a["rsi"] > a["rsi_prev"] and vr >= 2 and px > a["open"]:
-            out.append({"setup": "rsi_reversal", "side": "LONG", "confidence": conf(0.45, 1),
-                        "why": f"RSI {a['rsi_prev']:.0f}->{a['rsi']:.0f}, capitulation vol x{vr:.1f}"})
+            add({"setup": "rsi_reversal", "side": "LONG", "confidence": conf(0.45, 1),
+                 "why": f"RSI {a['rsi_prev']:.0f}->{a['rsi']:.0f}, capitulation vol x{vr:.1f}"}, trend_gate=False)
         if a["rsi_prev"] > 75 and a["rsi"] < a["rsi_prev"] and vr >= 2 and px < a["open"]:
-            out.append({"setup": "rsi_reversal", "side": "SHORT", "confidence": conf(0.45, -1),
-                        "why": f"RSI {a['rsi_prev']:.0f}->{a['rsi']:.0f}, euphorie vol x{vr:.1f}"})
+            add({"setup": "rsi_reversal", "side": "SHORT", "confidence": conf(0.45, -1),
+                 "why": f"RSI {a['rsi_prev']:.0f}->{a['rsi']:.0f}, euphorie vol x{vr:.1f}"}, trend_gate=False)
     # 4) spike de volume pur (info, pas de trade)
     if vr >= 4:
         side = "LONG" if px > a["open"] else "SHORT"
         out.append({"setup": "volume_spike", "side": side, "confidence": 0.5, "info_only": True,
                     "why": f"volume x{vr:.1f} la moyenne, bougie {'verte' if side == 'LONG' else 'rouge'}"})
+    # v4.2 : confirmation VWAP de session + pente OBV (LONG : prix > VWAP et OBV montant ; SHORT inverse)
+    if VWAP_OBV in ("filter", "boost"):
+        for d in out:
+            if d.get("info_only") or d.get("filtered"):
+                continue
+            sg = 1 if d["side"] == "LONG" else -1
+            ok_v = a.get("vwap") is None or (px - a["vwap"]) * sg > 0
+            ok_o = a.get("obv_slope") is None or a["obv_slope"] * sg > 0
+            if VWAP_OBV == "filter":
+                if not (ok_v and ok_o):
+                    d["filtered"] = f"vwap/obv non confirmé (vwap {'ok' if ok_v else 'non'}, obv {'ok' if ok_o else 'non'})"
+            else:
+                b = VWAP_OBV_BONUS if (ok_v and ok_o) else -VWAP_OBV_BONUS if not (ok_v or ok_o) else 0.0
+                if b:
+                    d["confidence"] = round(max(0.0, min(0.95, d["confidence"] + b)), 2)
+                    d["why"] += f", vwap/obv {b:+.2f}"
     return out
 
 # ---------------------------------------------------------------- journal
@@ -397,7 +486,13 @@ CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY, mode TEXT, opened_ts T
 CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY, ts TEXT, type TEXT, key TEXT, payload TEXT,
   sent INTEGER, http_status INTEGER, suppressed_reason TEXT);
 CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS shadow_trades(id INTEGER PRIMARY KEY, opened_ts TEXT, closed_ts TEXT, timeframe TEXT,
+  setup TEXT, side TEXT, entry REAL, qty REAL, sl REAL, tp REAL, init_sl REAL, partial_done INTEGER DEFAULT 0,
+  partial_pnl REAL DEFAULT 0, exit REAL, pnl REAL, status TEXT, close_reason TEXT, signal_id INTEGER, max_hold_h REAL);
 """
+TRADE_COLS_V42 = {"init_sl": "REAL", "orig_qty": "REAL", "partial_done": "INTEGER DEFAULT 0", "partial_qty": "REAL",
+                  "partial_px": "REAL", "partial_pnl": "REAL DEFAULT 0", "partial_fees": "REAL DEFAULT 0",
+                  "partial_cid": "TEXT"}
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -407,6 +502,10 @@ class DB:
         self.c = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.c.execute("PRAGMA journal_mode=WAL")
         self.c.executescript(SCHEMA)
+        have = {r[1] for r in self.c.execute("PRAGMA table_info(trades)")}
+        for col, typ in TRADE_COLS_V42.items():   # v4.2 : migration douce (trades existants : NULL = pas de partielle)
+            if col not in have:
+                self.c.execute(f"ALTER TABLE trades ADD COLUMN {col} {typ}")
         self.lock = threading.Lock()
     def x(self, q, a=()):
         with self.lock:
@@ -450,7 +549,7 @@ class Alerter:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # ---- v4.1 : routage tampon / urgent
-    BATCHED = {"trade_open", "trade_close", "setup", "target"}
+    BATCHED = {"trade_open", "trade_close", "setup", "target", "partial", "autokill"}
 
     def send(self, payload, key=None, force=False):
         typ = payload.get("type", "alert")
@@ -579,6 +678,11 @@ class Alerter:
 # ---------------------------------------------------------------- engine
 def fmt(x, prec):
     return f"{x:.{prec}f}"
+
+def fee_estimate(qty, px):
+    """v4.2 : entrée post-only = maker, sortie = taker (pire cas : SL au marché)."""
+    entry_rate = MAKER_FEE_RATE if (FEE_MODEL_MAKER and ENTRY_POST_ONLY) else FEE_RATE
+    return (entry_rate + FEE_RATE) * qty * px
 
 def round_down(x, prec):
     f = 10 ** prec
@@ -787,9 +891,9 @@ class Engine:
         ot = self.open_trades()
         if len(ot) >= MAX_OPEN:
             return f"max {MAX_OPEN} positions"
+        if sum(1 for t in ot if t["timeframe"] == tf) >= MAX_PER_TF:
+            return f"déjà {MAX_PER_TF} position(s) {tf}"
         for t in ot:
-            if t["timeframe"] == tf:
-                return f"déjà une position {tf}"
             if t["side"] != side:
                 return "position opposée ouverte (pas de hedge)"
             if self.price and (self.price - t["entry"]) * (1 if t["side"] == "LONG" else -1) < 0:
@@ -828,7 +932,7 @@ class Engine:
             except Exception as e:
                 log.warning("account() pour sizing: %s", e)
         qty = round_down(max(min(qty, max_qty), 0), self.qty_prec)
-        fees = FEE_RATE * qty * px * 2
+        fees = fee_estimate(qty, px)
         real_risk = qty * sl_dist + fees
         return {"price": round(px, 1), "sl": round(sl, self.px_prec), "tp": round(tp, self.px_prec), "qty": qty,
                 "sl_dist": sl_dist, "risk_usdt": round(real_risk, 3), "fees": round(fees, 3),
@@ -841,6 +945,16 @@ class Engine:
         if not a:
             return
         for s in detect(tf, a, self.ctx):
+            if s.get("filtered") is None and not s.get("info_only") and tf == "1h":
+                k = self.kronos_veto(s["side"])
+                if k:
+                    s["filtered"] = k
+            if s.get("filtered"):   # v4.2 : filtre journalisé (comptable), pas de plan / alerte / ordre
+                self.db.x("INSERT INTO signals(ts,timeframe,setup,side,price,confidence,why,acted,skip_reason) "
+                          "VALUES(?,?,?,?,?,?,?,0,?)", (now_iso(), tf, s["setup"], s["side"], a["close"],
+                                                         s["confidence"], s["why"], "filtre: " + s["filtered"]))
+                log.info("signal filtré %s %s %s : %s", tf, s["setup"], s["side"], s["filtered"])
+                continue
             p = self.plan(tf, s["side"], a)
             sid = self.db.x("INSERT INTO signals(ts,timeframe,setup,side,price,sl,tp,confidence,why) "
                             "VALUES(?,?,?,?,?,?,?,?,?)", (now_iso(), tf, s["setup"], s["side"], p["price"],
@@ -860,6 +974,9 @@ class Engine:
                         if p.get("available") is not None else f"qty {p['qty']} < min {self.min_qty}")
             elif p["fee_share"] > MAX_FEE_SHARE:
                 skip = f"frais {p['fee_share']:.0%} du risque > {MAX_FEE_SHARE:.0%}"
+            elif self.killed(tf, s["setup"]):
+                skip = "auto-kill: paper (shadow)"
+                self.shadow_open(tf, s, p, sid)
             else:
                 skip = self.can_open(s["side"], tf)
             acted = False
@@ -868,7 +985,8 @@ class Engine:
             elif skip is None:
                 skip = "AUTO_TRADE=0 (décision agents)"
             self.db.x("UPDATE signals SET acted=?, skip_reason=? WHERE id=?", (1 if acted else 0, skip, sid))
-            if not acted and s["confidence"] >= MIN_CONF_ALERT and not s.get("info_only") or \
+            if not acted and s["confidence"] >= MIN_CONF_ALERT and not s.get("info_only") and \
+               not str(skip or "").startswith("auto-kill") or \
                (s.get("info_only") and tf in ("15m", "1h", "4h", "1d")):
                 self.alert.send({"type": "setup", "timeframe": tf, "setup": s["setup"], "side": s["side"],
                                  "price": p["price"], "sl": p["sl"], "tp": p["tp"], "confidence": s["confidence"],
@@ -944,13 +1062,17 @@ class Engine:
             if limit_px:
                 entry = round(limit_px, self.px_prec)   # post-only : rempli exactement au prix limite
         tid = self.db.x("INSERT INTO trades(mode,opened_ts,timeframe,setup,side,entry,qty,leverage,margin,sl,tp,"
-                        "risk_usdt,status,client_id,position_id,signal_id,confidence,max_hold_h) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'OPEN',?,?,?,?,?)",
+                        "risk_usdt,status,client_id,position_id,signal_id,confidence,max_hold_h,init_sl,orig_qty,partial_done) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'OPEN',?,?,?,?,?,?,?,0)",
                         (mode, now_iso(), tf, s["setup"], side, entry, p["qty"], LEVERAGE, p["margin"], p["sl"],
                          p["tp"], p["risk_usdt"], cid, pos_id, sid, s["confidence"],
-                         TF_MAX_HOLD_H.get(tf, 24))).lastrowid
+                         TF_MAX_HOLD_H.get(tf, 24), p["sl"] if PARTIAL_TP else None, p["qty"])).lastrowid
         if REAL_ORDERS:
             self.verify_entry_tpsl(tid, partial=bool(limit_px) and p["qty"] + 1e-12 < float(body["qty"]))
+            if PARTIAL_TP and PARTIAL_LIMIT:
+                self.place_partial_limit(self.db.q("SELECT * FROM trades WHERE id=?", (tid,))[0])
+                time.sleep(1.0)
+                self.verify_entry_tpsl(tid)   # le SL doit toujours être là après la pose de la partielle
         self.alert.send({"type": "trade_open", "timeframe": tf, "setup": s["setup"], "side": side,
                          "price": entry, "sl": p["sl"], "tp": p["tp"], "confidence": s["confidence"],
                          "qty": p["qty"], "margin": p["margin"], "risk_usdt": p["risk_usdt"], "why": s["why"],
@@ -1207,9 +1329,11 @@ class Engine:
         try:
             self.api.tpsl_place(t["position_id"], t["qty"], t["sl"], t["tp"], self.qty_prec, self.px_prec)
             self.db.ev("tpsl_replaced", {"trade": t["id"], "sl": t["sl"], "tp": t["tp"], "qty": t["qty"]}, level="WARNING")
+            return True
         except Exception as e:
             log.error("tpsl_place #%s: %s", t["id"], e)
             self.urgent("no_sl", f"#{t['id']} re-pose TP/SL échouée ({e}) : trade sans SL", key=f"nosl:{t['id']}")
+            return False
 
     def _tpsl_canceled(self, t):
         """True si les TP/SL du trade ont été ANNULÉS (pas exécutés) -> on les re-pose, trade reste ouvert."""
@@ -1244,11 +1368,24 @@ class Engine:
                 tpsl = self.api.tpsl_pending(SYMBOL)
             except Exception as e:
                 log.warning("tpsl_pending(): %s", e)
+        need = set(self.db.get("need_tpsl", []) or [])
         for t in self.open_trades():
             opened_ms = datetime.fromisoformat(t["opened_ts"]).timestamp() * 1000
             seg = [b for b in bars if b["t"] + 60000 > opened_ms] or [{"h": self.price, "l": self.price}]
             hi, lo = max(b["h"] for b in seg), min(b["l"] for b in seg)
             exit_px = reason = None
+            if PARTIAL_TP and t.get("init_sl") and not t.get("partial_done"):
+                try:
+                    if self.partial_step(t, hi, lo):
+                        continue   # TP/SL re-posés pour la qty restante : suivi au prochain tour
+                except Exception as e:
+                    log.exception("partielle #%s: %s", t["id"], e)
+            if REAL_ORDERS and t["id"] in need:   # re-pose TP/SL après partielle en échec
+                if self.replace_tpsl(t):
+                    need.discard(t["id"]); self.db.set("need_tpsl", sorted(need))
+                continue
+            if REAL_ORDERS and time.time() < float((self.db.get("partial_guard", {}) or {}).get(str(t["id"]), 0)):
+                continue   # juste après la partielle : TP/SL en cours de remplacement
             if REAL_ORDERS:
                 if live_pos is not None and t["position_id"] and str(t["position_id"]) not in live_pos:
                     exit_px, reason = self.price, "fermée sur l'exchange (SL/TP)"
@@ -1287,10 +1424,240 @@ class Engine:
             if exit_px is not None:
                 self.close_trade(t, exit_px, reason)
 
+    # -- v4.2 : clôture partielle à 1R puis SL au break-even + frais
+    def r1_price(self, t):
+        sg = 1 if t["side"] == "LONG" else -1
+        return round(t["entry"] + sg * PARTIAL_R * abs(t["entry"] - t["init_sl"]), self.px_prec)
+
+    def be_price(self, t):
+        sg = 1 if t["side"] == "LONG" else -1
+        return round(t["entry"] * (1 + sg * BE_FEE_PCT / 100), self.px_prec)
+
+    def partial_qtys(self, t):
+        pq = round_down(t["qty"] * PARTIAL_FRAC, self.qty_prec)
+        rest = round_down(t["qty"] - pq, self.qty_prec)
+        return (pq, rest) if pq >= self.min_qty and rest >= self.min_qty else (0.0, t["qty"])
+
+    def place_partial_limit(self, t):
+        """Ordre limite de clôture (qty partielle) au prix 1R, attaché à la position (hedge : par positionId)."""
+        pq, _ = self.partial_qtys(t)
+        if not pq or not t["position_id"]:
+            return
+        cid = f"v4p{t['id']}{secrets.token_hex(3)}"
+        body = {"symbol": SYMBOL, "side": "BUY" if t["side"] == "LONG" else "SELL", "tradeSide": "CLOSE",
+                "positionId": str(t["position_id"]), "qty": fmt(pq, self.qty_prec), "orderType": "LIMIT",
+                "price": fmt(self.r1_price(t), self.px_prec), "effect": "GTC", "clientId": cid}
+        try:
+            self.api.place_order(body)
+            self.db.x("UPDATE trades SET partial_cid=? WHERE id=?", (cid, t["id"]))
+            self.db.ev("partial_limit_placed", {"trade": t["id"], "qty": pq, "px": body["price"], "cid": cid})
+        except Exception as e:   # repli : partielle au marché quand le prix touche 1R
+            self.db.ev("partial_limit_failed", {"trade": t["id"], "err": str(e)}, level="WARNING")
+
+    def partial_step(self, t, hi, lo):
+        """Retourne True si la partielle vient d'être exécutée (trade mis à jour)."""
+        sg = 1 if t["side"] == "LONG" else -1
+        r1 = self.r1_price(t)
+        pq, rest = self.partial_qtys(t)
+        if not pq:
+            self.db.x("UPDATE trades SET partial_done=2 WHERE id=?", (t["id"],)); return False   # qty trop petite
+        if not REAL_ORDERS:
+            touched = (hi >= r1) if sg > 0 else (lo <= r1)
+            if not touched or ((lo <= t["sl"]) if sg > 0 else (hi >= t["sl"])):
+                return False   # SL et 1R dans la même bougie : prudence, le SL prime
+            self.after_partial(t, r1, pq, rest, maker=True); return True
+        cid, filled, fpx = t.get("partial_cid"), 0.0, r1
+        if cid:
+            try:
+                det = self.api.order_detail(cid) or {}
+            except Exception as e:
+                log.warning("order_detail partielle %s: %s", cid, e); return False
+            st = str(det.get("status") or "").upper().strip("_")
+            filled = round_down(float(det.get("tradeQty") or 0), self.qty_prec)
+            try: fpx = float(det.get("avgPrice") or det.get("price") or r1)
+            except (TypeError, ValueError): fpx = r1
+            if st == "FILLED" or (filled >= self.min_qty and "CANCEL" in st):
+                pq, rest = filled, round_down(t["qty"] - filled, self.qty_prec)
+                self.after_partial(t, fpx, pq, rest, maker=True); return True
+            if "CANCEL" in st:   # annulée sans remplissage -> repli marché
+                self.db.x("UPDATE trades SET partial_cid=NULL WHERE id=?", (t["id"],)); t["partial_cid"] = None
+            else:
+                return False     # en attente (NEW / PART_FILLED)
+        px = self.price
+        if not px or not ((px >= r1) if sg > 0 else (px <= r1)):
+            return False
+        self.api.close_qty(t["position_id"], t["side"], pq, self.qty_prec)   # repli : marché
+        self.after_partial(t, px, pq, rest, maker=False)
+        return True
+
+    def after_partial(self, t, px, pq, rest, maker):
+        sg = 1 if t["side"] == "LONG" else -1
+        fees = (MAKER_FEE_RATE if maker else FEE_RATE) * pq * px + (MAKER_FEE_RATE if (FEE_MODEL_MAKER and ENTRY_POST_ONLY)
+                                                                    else FEE_RATE) * pq * t["entry"]
+        ppnl = sg * (px - t["entry"]) * pq - fees
+        new_sl = self.be_price(t) if BE_AFTER_PARTIAL else t["sl"]
+        mine = []
+        if REAL_ORDERS:
+            try: mine = self.own_tpsl(t, self.api.tpsl_pending(SYMBOL))   # avec les ANCIENS prix sl/tp
+            except Exception as e: log.warning("tpsl_pending partielle: %s", e)
+        self.db.x("UPDATE trades SET partial_done=1, partial_qty=?, partial_px=?, partial_pnl=?, partial_fees=?, "
+                  "qty=?, sl=?, margin=? WHERE id=?", (pq, round(px, self.px_prec), round(ppnl, 4), round(fees, 4),
+                                                        rest, new_sl, round(rest * t["entry"] / LEVERAGE, 3), t["id"]))
+        if not REAL_ORDERS:
+            self.db.set("paper_equity", round(self.db.get("paper_equity", START_EQUITY) + ppnl, 4))
+        else:
+            g = self.db.get("partial_guard", {}) or {}
+            g[str(t["id"])] = time.time() + 45; self.db.set("partial_guard", g)
+            for o in mine:   # anciens TP/SL (qty entière) -> remplacés par TP/SL de la qty restante
+                try: self.api.tpsl_cancel(o.get("id"))
+                except Exception as e: log.warning("tpsl_cancel partielle %s: %s", o.get("id"), e)
+            time.sleep(0.5)
+            nt = self.db.q("SELECT * FROM trades WHERE id=?", (t["id"],))[0]
+            ok = False
+            for _ in range(2):
+                try:
+                    self.api.tpsl_place(nt["position_id"], rest, new_sl, nt["tp"], self.qty_prec, self.px_prec)
+                    ok = True; break
+                except Exception as e:
+                    log.error("tpsl_place après partielle #%s: %s", t["id"], e); time.sleep(1.0)
+            if not ok:
+                need = set(self.db.get("need_tpsl", []) or []); need.add(t["id"]); self.db.set("need_tpsl", sorted(need))
+                self.urgent("no_sl", f"#{t['id']} partielle faite mais SL BE non posé : nouvel essai", key=f"nosl:{t['id']}")
+            time.sleep(0.5)
+            self.repair_tpsl(t["position_id"], exclude=t["id"])
+        self.db.ev("partial", {"trade": t["id"], "qty": pq, "px": px, "pnl": round(ppnl, 4), "rest": rest, "sl": new_sl})
+        self.alert.send({"type": "partial", "trade_id": t["id"], "timeframe": t["timeframe"], "side": t["side"],
+                         "price": round(px, 1), "qty": pq, "pnl": round(ppnl, 4),
+                         "why": f"#{t['id']} {t['timeframe']} {t['side']} partielle {pq} @{px:.1f} pnl {ppnl:+.4f}, "
+                                f"SL -> {new_sl} (BE+frais), reste {rest}"}, key=f"partial:{t['id']}")
+
+    # -- v4.2 : filtre Kronos 1h (lecture seule, jamais bloquant en cas d'échec)
+    def kronos_state(self):
+        c = getattr(self, "_kronos", None)
+        if c and time.time() - c["t"] < 600:
+            return c
+        c = {"t": time.time(), "on": False, "acc": None, "n": 0}
+        try:
+            k = sqlite3.connect(f"file:{KRONOS_DB}?mode=ro", uri=True, timeout=2)
+            n, ok = k.execute("SELECT COUNT(*), SUM(correct=1) FROM predictions WHERE timeframe='1h' "
+                              "AND correct IS NOT NULL").fetchone()
+            k.close()
+            c["n"], c["acc"] = n or 0, (ok or 0) / n if n else None
+            c["on"] = bool(KRONOS_FILTER and n and n >= KRONOS_MIN_N and c["acc"] >= KRONOS_MIN_ACC)
+        except Exception as e:
+            log.info("kronos indisponible (ignoré): %s", e)
+        if c["on"] != (getattr(self, "_kronos", None) or {}).get("on", None):
+            self.db.ev("kronos_state", {"on": c["on"], "acc": c["acc"], "n": c["n"]})
+        self._kronos = c
+        return c
+
+    def kronos_veto(self, side):
+        try:
+            if not KRONOS_FILTER or not self.kronos_state()["on"]:
+                return None
+            k = sqlite3.connect(f"file:{KRONOS_DB}?mode=ro", uri=True, timeout=2)
+            r = k.execute("SELECT created_at, pred_direction, pred_change_pct FROM predictions WHERE timeframe='1h' "
+                          "ORDER BY id DESC LIMIT 1").fetchone()
+            k.close()
+            if not r:
+                return None
+            age_h = (time.time() - datetime.fromisoformat(r[0]).replace(tzinfo=timezone.utc).timestamp()) / 3600
+            if age_h > KRONOS_MAX_AGE_H:
+                return None
+            d = str(r[1] or "").upper()
+            if (side == "LONG" and d == "DOWN") or (side == "SHORT" and d == "UP"):
+                return f"kronos 1h {d} ({r[2]:+.2f}%) contre {side}"
+        except Exception as e:
+            log.info("kronos veto ignoré: %s", e)
+        return None
+
+    # -- v4.2 : auto-kill setup x TF -> paper (shadow) puis réactivation
+    def killed(self, tf, setup):
+        return AUTO_KILL and tf in TRADE_TIMEFRAMES and f"{setup}|{tf}" in (self.db.get("autokill", {}) or {})
+
+    def shadow_open(self, tf, s, p, sid):
+        if self.db.q("SELECT 1 FROM shadow_trades WHERE status='OPEN' AND timeframe=? AND setup=?", (tf, s["setup"])):
+            return
+        self.db.x("INSERT INTO shadow_trades(opened_ts,timeframe,setup,side,entry,qty,sl,tp,init_sl,status,signal_id,"
+                  "max_hold_h) VALUES(?,?,?,?,?,?,?,?,?,'OPEN',?,?)",
+                  (now_iso(), tf, s["setup"], s["side"], p["price"], p["qty"], p["sl"], p["tp"], p["sl"], sid,
+                   TF_MAX_HOLD_H.get(tf, 24)))
+
+    def manage_shadow(self, hi_lo_bars):
+        for t in self.db.q("SELECT * FROM shadow_trades WHERE status='OPEN'"):
+            opened_ms = datetime.fromisoformat(t["opened_ts"]).timestamp() * 1000
+            seg = [b for b in hi_lo_bars if b["t"] + 60000 > opened_ms] or [{"h": self.price, "l": self.price}]
+            hi, lo = max(b["h"] for b in seg), min(b["l"] for b in seg)
+            sg = 1 if t["side"] == "LONG" else -1
+            q = t["qty"] or 0
+            if PARTIAL_TP and not t["partial_done"]:
+                r1 = t["entry"] + sg * PARTIAL_R * abs(t["entry"] - t["init_sl"])
+                if ((hi >= r1) if sg > 0 else (lo <= r1)) and not ((lo <= t["sl"]) if sg > 0 else (hi >= t["sl"])):
+                    pq = q * PARTIAL_FRAC
+                    ppnl = sg * (r1 - t["entry"]) * pq - fee_estimate(pq, r1)
+                    nsl = t["entry"] * (1 + sg * BE_FEE_PCT / 100) if BE_AFTER_PARTIAL else t["sl"]
+                    self.db.x("UPDATE shadow_trades SET partial_done=1, partial_pnl=?, qty=?, sl=? WHERE id=?",
+                              (ppnl, q - pq, nsl, t["id"]))
+                    continue
+            ex = None
+            if (lo <= t["sl"]) if sg > 0 else (hi >= t["sl"]): ex = (t["sl"], "SL")
+            elif (hi >= t["tp"]) if sg > 0 else (lo <= t["tp"]): ex = (t["tp"], "TP")
+            elif (time.time() * 1000 - opened_ms) / 3.6e6 >= (t["max_hold_h"] or 24): ex = (self.price, "temps max")
+            if ex:
+                pnl = sg * (ex[0] - t["entry"]) * q - fee_estimate(q, ex[0]) + (t["partial_pnl"] or 0)
+                self.db.x("UPDATE shadow_trades SET status='CLOSED', closed_ts=?, exit=?, pnl=?, close_reason=? WHERE id=?",
+                          (now_iso(), ex[0], round(pnl, 4), ex[1], t["id"]))
+
+    def autokill_check(self):
+        if not AUTO_KILL or time.time() - float(self.db.get("autokill_last", 0) or 0) < 1800:
+            return
+        self.db.set("autokill_last", time.time())
+        now = time.time()
+        since = datetime.fromtimestamp(now - AUTO_KILL_DAYS * 86400, timezone.utc).isoformat(timespec="seconds")
+        killed = self.db.get("autokill", {}) or {}
+        reen = self.db.get("autokill_reenabled", {}) or {}
+        events = []
+        rows = self.db.q("SELECT timeframe, setup, pnl, closed_ts FROM trades WHERE status='CLOSED' AND mode=? "
+                         "AND closed_ts>=?", (self.mode, since))
+        stats = {}
+        killed = {k: v for k, v in killed.items() if k.split("|")[1] in TRADE_TIMEFRAMES}
+        for r in rows:
+            if r["timeframe"] not in TRADE_TIMEFRAMES:
+                continue   # TF non tradé (ex. 1m) : rien à couper
+            key = f"{r['setup']}|{r['timeframe']}"
+            if r["closed_ts"] < reen.get(key, ""):
+                continue   # après réactivation : on ne re-juge que les nouveaux trades
+            s = stats.setdefault(key, [0, 0, 0.0]); s[0] += 1; s[1] += (r["pnl"] or 0) > 0; s[2] += r["pnl"] or 0
+        for key, (n, w, pnl) in stats.items():
+            if key in killed or n < AUTO_KILL_MIN_N:
+                continue
+            if pnl < 0 and w / n < AUTO_KILL_MAX_WR:
+                killed[key] = {"since": now_iso(), "n": n, "wr": round(w / n, 2), "pnl": round(pnl, 3)}
+                events.append(f"AUTO-KILL {key} -> paper : {n} trades/{AUTO_KILL_DAYS:g}j, WR {w / n:.0%}, pnl {pnl:+.3f}")
+        for key, info in list(killed.items()):
+            t0 = datetime.fromisoformat(info["since"]).timestamp()
+            if now - t0 < AUTO_KILL_DAYS * 86400:
+                continue
+            setup, tf = key.split("|")
+            sh = self.db.q("SELECT COUNT(*) n, COALESCE(SUM(pnl),0) p FROM shadow_trades WHERE status='CLOSED' AND "
+                           "setup=? AND timeframe=? AND closed_ts>=? AND closed_ts>=?",
+                           (setup, tf, info["since"], since))[0]
+            if sh["n"] and sh["p"] > 0:
+                killed.pop(key); reen[key] = now_iso()
+                events.append(f"RÉACTIVÉ {key} : paper {sh['n']} trades pnl {sh['p']:+.3f} sur {AUTO_KILL_DAYS:g}j")
+        self.db.set("autokill", killed); self.db.set("autokill_reenabled", reen)
+        for ev in events:
+            self.db.ev("autokill", {"why": ev}, level="WARNING")
+        if events:   # 1 seul événement groupé (récap)
+            self.alert.send({"type": "autokill", "why": " | ".join(events), "killed": sorted(killed)}, key="autokill")
+
     def close_trade(self, t, px, reason):
         sgn = 1 if t["side"] == "LONG" else -1
-        fees = FEE_RATE * t["qty"] * (t["entry"] + px)
-        pnl = sgn * (px - t["entry"]) * t["qty"] - fees
+        if REAL_ORDERS and t.get("partial_cid") and not t.get("partial_done"):
+            try: self.api.cancel_orders(SYMBOL, client_ids=[t["partial_cid"]])   # partielle limite orpheline
+            except Exception as e: log.info("cancel partielle %s: %s", t["partial_cid"], e)
+        fees = FEE_RATE * t["qty"] * (t["entry"] + px) + float(t.get("partial_fees") or 0)
+        pnl = sgn * (px - t["entry"]) * t["qty"] - FEE_RATE * t["qty"] * (t["entry"] + px) + float(t.get("partial_pnl") or 0)
         self.db.x("UPDATE trades SET status='CLOSED', closed_ts=?, exit=?, pnl=?, fees=?, close_reason=? WHERE id=?",
                   (now_iso(), px, round(pnl, 4), round(fees, 4), reason, t["id"]))
         if not REAL_ORDERS:
@@ -1304,7 +1671,8 @@ class Engine:
             self.db.ev("pause", {"min": PAUSE_AFTER_LOSSES_MIN}, level="WARNING")
         self.alert.send({"type": "trade_close", "timeframe": t["timeframe"], "setup": t["setup"], "side": t["side"],
                          "price": px, "entry": t["entry"], "sl": t["sl"], "tp": t["tp"], "confidence": t["confidence"],
-                         "pnl": round(pnl, 4), "reason": reason, "trade_id": t["id"], "equity": round(eq, 2),
+                         "pnl": round(pnl, 4), "reason": reason + (" (après partielle)" if t.get("partial_done") else ""),
+                         "trade_id": t["id"], "equity": round(eq, 2),
                          "open_positions": len(self.open_trades())}, key=f"close:{t['id']}")
         self.check_global(eq)
 
@@ -1386,6 +1754,12 @@ class Engine:
         for tf in self.refresh():
             self.on_close(tf)
         self.manage()
+        if AUTO_KILL:
+            try:
+                self.manage_shadow(list(self.candles.get("1m", [])[-3:]) + ([self.live_1m] if getattr(self, "live_1m", None) else []))
+                self.autokill_check()
+            except Exception as e:
+                log.exception("auto-kill: %s", e)
         self.check_global()
         self.digest()
         self.alert.tick(self)
@@ -1394,7 +1768,10 @@ class Engine:
     def run(self, once=False):
         self.init_exchange()
         self.db.ev("start", {"mode": self.mode, "auto_trade": AUTO_TRADE, "tfs": TIMEFRAMES, "lev": LEVERAGE,
-                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL)})
+                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL), "version": "4.2",
+                             "rr": RR, "partial": PARTIAL_TP, "max_fee_share": MAX_FEE_SHARE, "atr_min": ATR_MIN_PCT,
+                             "vwap_obv": VWAP_OBV, "kronos": KRONOS_FILTER, "auto_kill": AUTO_KILL,
+                             "max_per_tf": MAX_PER_TF})
         if CONTROL_PORT and not once:
             start_control(self)
         if not once and E("STARTUP_ALERT", False, bool):

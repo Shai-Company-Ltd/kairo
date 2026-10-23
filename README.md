@@ -52,7 +52,8 @@ flowchart LR
 
 ## 📐 Stratégie
 
-- **Indicateurs** : EMA 20 / 50 / 200, RSI, ATR, VWAP, volume relatif, funding rate, ADX (v4.1).
+- **Indicateurs** : EMA 20 / 50 / 200, RSI, ATR, VWAP, volume relatif, funding rate, ADX (v4.1), ATR %, pente OBV (v4.2).
+- **Filtres v4.2** : ATR % minimum par TF (marchés plats écartés, seuils calibrés sur l'historique), breakout 5m strict (volume ≥ 2× la moyenne 20 + clôture au-delà), VWAP/OBV en bonus/malus de confiance, Kronos 1h (auto-activé seulement si précision ≥ 55 % sur ≥ 50 prédictions). Chaque rejet est journalisé dans `signals.skip_reason` (`filtre: …`).
 - **Setups** :
   - `breakout` — cassure de niveau confirmée par le volume et l'ADX ;
   - `pullback_ema20` — retour sur l'EMA20 dans le sens de la tendance (EMA50/200) ;
@@ -64,10 +65,13 @@ flowchart LR
 ## 🛡️ Gestion du risque
 
 - Levier **x20 en marge isolée**.
-- **1/4 du compte maximum** engagé en marge par trade (`MAX_MARGIN_PCT=25`), SL à `ATR × 1,5` (minimum 0,41 %), RR 2.
+- **Risque max 12 % de l'equity par trade** (`RISK_PCT=12`, v4.2 ; était 33 %), **plafonné par la marge** : 1/4 du compte maximum engagé par trade (`MAX_MARGIN_PCT=25`) — avec un petit compte c'est souvent ce plafond qui fixe la taille, donc le risque réel est en général bien inférieur à 12 %.
+- SL à `ATR × 1,5` (minimum 0,41 %), **TP à 1,5R** ; **50 % fermés à 1R** (ordre limite), puis SL au **break-even + frais** (v4.2).
+- Jusqu'à 2 positions par timeframe (`MAX_PER_TF=2`), 6 au total (`MAX_OPEN`).
+- **Auto-kill** (v4.2) : un setup×TF perdant sur 3 jours (n ≥ 8, PnL < 0, WR < 40 %) passe en paper, puis est réactivé si son résultat paper sur 3 jours est positif.
 - **Kill switch** : equity ≤ `KILL_EQUITY` → fermeture de tout et arrêt (HALT).
 - **SL et TP par trade** même sur position fusionnée, avec **réparation automatique** : TP/SL annulé par Bitunix → re-posé ; SL impossible à re-poser → fermeture au marché de la seule part du trade ; alerte urgente.
-- Frais plafonnés en part du risque (`MAX_FEE_SHARE`).
+- Frais plafonnés à 20 % du risque (`MAX_FEE_SHARE=0.20`), estimés maker à l'entrée post-only et taker à la sortie.
 
 ## 💸 Économie de tokens
 
@@ -88,7 +92,9 @@ L'équipe d'agents n'est pas réveillée à chaque événement :
 | `v4.0.4` | 22/10/2026 | Webhook fiable (retries, événements jamais plafonnés) |
 | `v4.0-stable` | 22/10/2026 | TP/SL par trade + réparation — version de référence |
 | `v4.1` | 23/10/2026 | Récaps 3 h, filtre ADX, entrées post-only, 1m retiré |
-| `v4.1.1` | 23/10/2026 | Réparation automatique du SL — **en production** |
+| `v4.1.1` | 23/10/2026 | Réparation automatique du SL |
+| `v4.1.2` | 23/10/2026 | Revue de performance 3 jours sans tokens |
+| `v4.2` | 23/10/2026 | TP 1,5R + partielle 1R + BE, frais 20 %, risque 12 %, filtres ATR%/VWAP-OBV/Kronos, auto-kill — **en production** |
 
 Changelog détaillé : [CHANGELOG.md](CHANGELOG.md).
 
@@ -137,6 +143,8 @@ Tout passe par `.env` (modèle : [`.env.example`](.env.example)). Points clés :
 | `WEBHOOK_URL/KEY` | Point d'entrée de l'équipe d'agents |
 | `WEBHOOK_BATCH`, `BATCH_HOURS` | Récaps groupés |
 | `ADX_FILTER`, `ENTRY_POST_ONLY`, `TP_LIMIT` | Nouveautés v4.1 (0 = désactivé) |
+| `RISK_PCT`, `RR`, `PARTIAL_TP`, `BE_AFTER_PARTIAL`, `MAX_PER_TF` | Risque 12 %, TP 1,5R, partielle 50 % à 1R, BE + frais (v4.2) |
+| `ATR_FILTER`/`ATR_MIN_PCT`, `BREAKOUT5M_STRICT`, `VWAP_OBV`, `KRONOS_FILTER`, `AUTO_KILL` | Filtres et auto-kill v4.2 (0 / off = désactivé) |
 
 > ⚠️ Ne jamais committer `.env` ni `journal.db` (déjà dans `.gitignore`).
 
@@ -148,14 +156,14 @@ git checkout v4.0-stable -- server/engine.py    # ou n'importe quel tag
 sudo systemctl restart trading-v4
 ```
 
-Les nouveautés v4.1 se désactivent aussi une par une dans `.env`, sans changer de code.
+Les nouveautés v4.1 et v4.2 se désactivent aussi une par une dans `.env`, sans changer de code.
 
 ## 🗺️ Roadmap
 
 - [ ] **Copy trading Bitunix** (devenir lead trader)
 - [ ] **Multi-paires** (ETH, SOL…)
 - [ ] **Backtest** sur l'historique des klines avec les mêmes règles
-- [ ] **Filtre Kronos** sur les entrées, si son taux de réussite observé le justifie
+- [x] **Filtre Kronos** 1h (v4.2, auto-activé si précision ≥ 55 % sur ≥ 50 prédictions)
 
 ## ⚠️ Avertissement
 
