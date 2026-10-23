@@ -2,6 +2,12 @@
 
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/). Dates en UTC+8.
 
+## [v4.2.1] — 2026-10-23
+### Corrigé (sécurité, demandé par Risk)
+- Après la partielle à 1R, la position n'est **jamais sans protection** : le SL (break-even + `BE_FEE_PCT`) et le TP de la qty restante sont appliqués **d'abord**, par modification en place (`/api/v1/futures/tpsl/modify_order`, même orderId) ; si la modification échoue, le nouvel ordre est posé **puis** l'ancien annulé ; si la pose échoue, l'ancien ordre reste actif.
+- Même règle pour la remise à la qty remplie après une entrée partielle (`verify_entry_tpsl`) ; les réparations des autres trades de la position fusionnée ne font que poser (aucune annulation préalable).
+- Repli conservé : après 3 échecs de pose du SL BE, la qty restante est fermée au marché (alerte urgente `no_sl`).
+
 ## [v4.2] — 2026-10-23
 ### Ajouté
 - **Sorties** : TP à 1,5R (`RR=1.5`) ; clôture partielle de 50 % à 1R (`PARTIAL_TP`, `PARTIAL_R`, `PARTIAL_FRAC`) par ordre limite posé à l'ouverture (`PARTIAL_LIMIT`, repli au marché) ; ensuite SL au break-even + frais (`BE_AFTER_PARTIAL`, `BE_FEE_PCT=0.10`). Positions fusionnées (hedge) : partielle par qty sur le `positionId`, puis remplacement des TP/SL du trade pour la qty restante et réparation de ceux des autres trades.

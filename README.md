@@ -94,7 +94,8 @@ L'équipe d'agents n'est pas réveillée à chaque événement :
 | `v4.1` | 23/10/2026 | Récaps 3 h, filtre ADX, entrées post-only, 1m retiré |
 | `v4.1.1` | 23/10/2026 | Réparation automatique du SL |
 | `v4.1.2` | 23/10/2026 | Revue de performance 3 jours sans tokens |
-| `v4.2` | 23/10/2026 | TP 1,5R + partielle 1R + BE, frais 20 %, risque 12 %, filtres ATR%/VWAP-OBV/Kronos, auto-kill — **en production** |
+| `v4.2` | 23/10/2026 | TP 1,5R + partielle 1R + BE, frais 20 %, risque 12 %, filtres ATR%/VWAP-OBV/Kronos, auto-kill |
+| `v4.2.1` | 23/10/2026 | SL/TP modifiés en place après la partielle (jamais sans SL) — **en production** |
 
 Changelog détaillé : [CHANGELOG.md](CHANGELOG.md).
 
