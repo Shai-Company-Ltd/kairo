@@ -2,6 +2,11 @@
 
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/). Dates en UTC+8.
 
+## [v4.1.2] — 2026-10-23
+### Ajouté
+- `review.py` : revue de performance 3 jours sans tokens (lecture seule), rapport Markdown FR avec verdicts par setup×TF et recommandations.
+- Timer systemd `trading-v4-review` tous les 3 jours à 05:30 UTC (13:30 UTC+8), Nice=10, MemoryMax=200M.
+
 ## [v4.1.1] — 2026-10-23
 ### Corrigé
 - **Réparation automatique du SL** : `fix_missing_sl` détecte un trade sans stop-loss, le re-pose, et ferme au marché la seule quantité du trade si le SL n'est plus posable (prix au-delà du SL ou 2 échecs) ; alerte urgente `no_sl`.

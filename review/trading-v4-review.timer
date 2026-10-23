@@ -1,0 +1,9 @@
+[Unit]
+Description=trading-v4 review every 3 days at 05:30 UTC
+
+[Timer]
+OnCalendar=*-*-01/3 05:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=trading-v4 3-day performance review (read-only)
+
+[Service]
+Type=oneshot
+User=trader
+ExecStart=/usr/bin/python3 /opt/trading-v4/review.py
+Nice=10
+MemoryMax=200M

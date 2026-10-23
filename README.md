@@ -164,3 +164,6 @@ Ce projet est expérimental. Le trading de contrats à terme avec effet de levie
 ## 📄 Licence
 
 © 2026 Dontbyshai — **Tous droits réservés.** Code propriétaire : toute copie, modification ou redistribution est interdite sans autorisation écrite.
+
+## Revue de performance (v4.1.2)
+`review.py` (stdlib, DB en lecture seule) analyse les 3 derniers jours + l'historique : PnL, WR, PF, moyennes, drawdown, frais, ventilation setup/TF/sens/sortie, verdicts ✅/⚠️/❌ (n≥8), recommandations et précision Kronos. Rapport : `/opt/trading-v4/reviews/latest.md`. Timer systemd `review/trading-v4-review.timer` (`*-*-01/3 05:30 UTC` = 13:30 UTC+8, Nice=10, MemoryMax=200M).
