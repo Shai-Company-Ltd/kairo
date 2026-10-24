@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Moteur trading v4.2.1 — BTCUSDT Bitunix USDT-M, isolé, hedge, multi-timeframes.
+"""Moteur trading v4.2.2 — BTCUSDT Bitunix USDT-M, isolé, hedge, multi-timeframes.
 
+v4.2.2 : compte HEDGE (positionId partagé) -> chaque trade possède SES ordres SL/TP (orderId en base),
+dimensionnés à SA qty restante ; re-pose plafonnée à la qty libre, jamais de doublon ; 30004/taille 0 = clos.
 v4.2 : TP 1.5R + clôture partielle 50 % à 1R (limite) puis SL au break-even + frais,
 frais estimés maker/taker (MAX_FEE_SHARE 0.20), RISK_PCT 12, 2 positions par TF,
 breakout 5m strict (vol x2), filtre ATR% par TF, confirmation VWAP/OBV, filtre Kronos 1h
@@ -246,10 +248,10 @@ class Bitunix:
                                   "tradeSide": "CLOSE", "positionId": str(position_id),
                                   "qty": fmt(qty, prec), "orderType": "MARKET"}, private=True, retries=1)
     def tpsl_pending(self, symbol=None):
-        d = self.request("GET", "/api/v1/futures/tpsl/get_pending_orders", {"symbol": symbol}, private=True)
+        d = self.request("GET", "/api/v1/futures/tpsl/get_pending_orders", {"symbol": symbol, "limit": 100}, private=True)
         return d if isinstance(d, list) else (d or {}).get("orderList", []) if isinstance(d, dict) else []
     def tpsl_history(self, symbol=None):
-        d = self.request("GET", "/api/v1/futures/tpsl/get_history_orders", {"symbol": symbol}, private=True)
+        d = self.request("GET", "/api/v1/futures/tpsl/get_history_orders", {"symbol": symbol, "limit": 100}, private=True)
         return d if isinstance(d, list) else (d or {}).get("orderList", []) if isinstance(d, dict) else []
     def tpsl_place(self, position_id, qty, sl, tp, qprec=4, pprec=1):
         body = {"symbol": SYMBOL, "positionId": str(position_id),
@@ -512,7 +514,9 @@ CREATE TABLE IF NOT EXISTS shadow_trades(id INTEGER PRIMARY KEY, opened_ts TEXT,
 """
 TRADE_COLS_V42 = {"init_sl": "REAL", "orig_qty": "REAL", "partial_done": "INTEGER DEFAULT 0", "partial_qty": "REAL",
                   "partial_px": "REAL", "partial_pnl": "REAL DEFAULT 0", "partial_fees": "REAL DEFAULT 0",
-                  "partial_cid": "TEXT"}
+                  "partial_cid": "TEXT",
+                  # v4.2.2 : identité des ordres TP/SL par trade (compte HEDGE, positionId partagé)
+                  "sl_order_id": "TEXT", "tp_order_id": "TEXT"}
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -1166,155 +1170,368 @@ class Engine:
         return px, tq
 
     def verify_entry_tpsl(self, tid, partial=False):
-        """Après ouverture : le trade doit avoir SON SL (et TP) sur Bitunix ; sinon on les pose."""
-        t = self.db.q("SELECT * FROM trades WHERE id=?", (tid,))[0]
+        """Après ouverture : le trade doit avoir SON SL (et TP) sur Bitunix ; sinon on les pose.
+        v4.2.2 : les ordres posés avec l'entrée sont adoptés (orderId stocké en base) ; ensuite tout passe par l'id."""
+        t = self._fresh(tid)
         if not t["position_id"]:
             self.urgent("no_sl", f"#{tid} position introuvable après ouverture : SL non vérifiable", key=f"nosl:{tid}"); return
         try:
-            mine = self.own_tpsl(t, self.api.tpsl_pending(SYMBOL))
+            self.adopt_ids(t, self.pend(t["position_id"]))
         except Exception as e:
             log.warning("verify tpsl_pending: %s", e); return
-        if partial and mine:   # v4.2.1 : ramener à la qty remplie EN PLACE (jamais sans SL)
-            ok, part = self.swap_tpsl(t, mine, t["qty"], t["sl"], t["tp"])
-            if ok:
-                return
-            mine = [o for o in mine if (o.get("slPrice") and part["sl"]) or (o.get("tpPrice") and part["tp"])] or mine
-        if not any(o.get("slPrice") for o in mine):
-            self.replace_tpsl(t)
+        if partial:   # ramener à la qty remplie EN PLACE (même orderId)
+            self.swap_tpsl(t, t["qty"], t["sl"], t["tp"])
+        self.ensure_tpsl(t)
+
+    # ---------------------------------------------------------------- v4.2.2 : identité TP/SL par orderId
+    # Compte HEDGE : tous les trades d'un même sens partagent UN positionId. Chaque trade possède SES ordres
+    # (sl_order_id / tp_order_id en base), dimensionnés à SA qty restante. Plus aucun rapprochement par prix
+    # (sauf adoption unique des ordres posés avec l'entrée, qui ne renvoie pas d'id).
+    @staticmethod
+    def _kind(o):
+        return "sl" if o.get("slPrice") else "tp"
 
     @staticmethod
-    def own_tpsl(t, orders):
-        """Ordres TP/SL Bitunix appartenant à CE trade (même position, prix SL/TP du trade)."""
-        out = []
-        for o in orders or []:
-            if str(o.get("positionId")) != str(t["position_id"]):
-                continue
-            sl, tp = o.get("slPrice"), o.get("tpPrice")
-            if (sl and t["sl"] and abs(float(sl) - t["sl"]) < 0.06) or (tp and t["tp"] and abs(float(tp) - t["tp"]) < 0.06):
-                out.append(o)
+    def _oqty(o):
+        k = "slQty" if o.get("slPrice") else "tpQty"
+        try: return float(o.get(k) or 0)
+        except (TypeError, ValueError): return 0.0
+
+    def _fresh(self, t):
+        tid = t if isinstance(t, int) else t["id"]
+        r = self.db.q("SELECT * FROM trades WHERE id=?", (tid,))
+        return r[0] if r else None
+
+    def _set_oid(self, t, kind, oid):
+        oid = str(oid) if oid else None
+        self.db.x(f"UPDATE trades SET {kind}_order_id=? WHERE id=?", (oid, t["id"]))
+        t[f"{kind}_order_id"] = oid
+
+    def _claimed(self, exclude=None):
+        s = set()
+        for o in self.open_trades():
+            if o["id"] != exclude:
+                s.update(str(o[k]) for k in ("sl_order_id", "tp_order_id") if o.get(k))
+        return s
+
+    def pend(self, pid=None):
+        return [o for o in self.api.tpsl_pending(SYMBOL) if pid is None or str(o.get("positionId")) == str(pid)]
+
+    def pos_qty(self, pid):
+        return sum(float(ps.get("qty") or 0) for ps in self.api.positions(SYMBOL)
+                   if str(ps.get("positionId")) == str(pid))
+
+    def own_tpsl(self, t, orders):
+        """Ordres TP/SL de CE trade : uniquement par orderId (jamais par prix)."""
+        ids = {str(t[k]) for k in ("sl_order_id", "tp_order_id") if t.get(k)}
+        return [o for o in orders or [] if str(o.get("id")) in ids]
+
+    def adopt_ids(self, t, pend):
+        """Trade sans orderId pour sl/tp (entrée avec TP/SL attachés, ou trade d'avant v4.2.2) :
+        adopte UNE fois l'ordre en attente non revendiqué, même position, même prix (qty la plus proche)."""
+        need = [k for k in ("sl", "tp") if not t.get(f"{k}_order_id")]
+        if not need or not t.get("position_id"):
+            return
+        claimed = self._claimed(exclude=t["id"])
+        for kind in need:
+            c = [o for o in pend or [] if str(o.get("positionId")) == str(t["position_id"]) and self._kind(o) == kind
+                 and str(o.get("id")) not in claimed and o.get(f"{kind}Price")
+                 and abs(float(o[f"{kind}Price"]) - float(t[kind])) < 0.06]
+            if c:
+                o = min(c, key=lambda o: abs(self._oqty(o) - t["qty"]))
+                self._set_oid(t, kind, o.get("id"))
+                self.db.ev("tpsl_adopted", {"trade": t["id"], "kind": kind, "order": o.get("id"), "qty": self._oqty(o)})
+
+    def _free_qty(self, t, kind, pos, pend):
+        """Qty de la position non couverte par les ordres `kind` (sl ou tp) des AUTRES trades (et orphelins)."""
+        mine = {str(t.get(f"{kind}_order_id"))}
+        used = sum(self._oqty(o) for o in pend if self._kind(o) == kind and str(o.get("id")) not in mine)
+        return max(0.0, pos - used)
+
+    def _tp_limit_live(self, t):
+        """TP limite déclenché : l'ordre limite de clôture est encore en carnet -> ne rien doubler."""
+        if not TP_LIMIT:
+            return False
+        try:
+            for o in self.api.pending_orders(SYMBOL):
+                if str(o.get("positionId")) == str(t["position_id"]) and o.get("price") and \
+                        abs(float(o["price"]) - float(t["tp"])) < 0.06 and \
+                        str(o.get("clientId") or "") != str(t.get("partial_cid") or "-"):
+                    return True
+        except Exception as e:
+            log.warning("pending_orders: %s", e); return True   # dans le doute : pas de doublon
+        return False
+
+    def _place_kind(self, t, kind, price, q):
+        """Pose UN ordre (sl ou tp) de qty q pour le trade et enregistre son orderId."""
+        r = self.api.tpsl_place_one(t["position_id"], q, sl=price if kind == "sl" else None,
+                                    tp=price if kind == "tp" else None, qprec=self.qty_prec, pprec=self.px_prec)
+        oid = str((r or {}).get("orderId") or "") or None
+        self._set_oid(t, kind, oid)
+        try:
+            time.sleep(0.3)
+            pend = self.pend(t["position_id"])
+            if not oid or oid not in {str(o.get("id")) for o in pend}:
+                self._set_oid(t, kind, None); self.adopt_ids(t, pend)
+        except Exception as e:
+            log.warning("vérif id %s #%s: %s", kind, t["id"], e)
+        self.db.ev("tpsl_placed", {"trade": t["id"], "kind": kind, "price": price, "qty": q,
+                                   "order": t.get(f"{kind}_order_id")}, level="WARNING")
+
+    def _sync_kind(self, t, kind, price, qty, pos, pend, modify):
+        """Un ordre (sl/tp) du trade. Retour : 'ok' | 'closed' | 'covered' | 'fail'.
+        - ordre propre vivant : rien (modify=False) ou modification EN PLACE (même orderId) ;
+        - sinon : qty plafonnée à la qty libre, jamais de doublon (TP limite déclenché en carnet = vivant)."""
+        byid = {str(o.get("id")): o for o in pend}
+        oid = t.get(f"{kind}_order_id")
+        old = byid.get(str(oid)) if oid else None
+        free = self._free_qty(t, kind, pos, pend)
+        q = round_down(min(qty, free), self.qty_prec)
+        if old is not None and not modify:
+            return "ok"
+        if old is not None:
+            q = round_down(min(qty, free), self.qty_prec)
+            try:
+                (self.api.tpsl_modify_sl if kind == "sl" else self.api.tpsl_modify_tp)(
+                    oid, price, q, self.qty_prec, self.px_prec)
+                self.db.ev("tpsl_modified", {"trade": t["id"], "kind": kind, "order": oid, "price": price, "qty": q})
+                return "ok"
+            except BitunixError as e:
+                if str(e.code) == "30004":
+                    return "closed"
+                log.warning("modify %s #%s: %s -> remplacement", kind, t["id"], e)
+            except Exception as e:
+                log.warning("modify %s #%s: %s -> remplacement", kind, t["id"], e)
+            oq = self._oqty(old)
+            if kind == "sl" and free - oq >= q - 1e-12 and q >= self.min_qty:
+                try:   # place PUIS annule (aucune fenêtre sans SL) : possible seulement si la qty libre le permet
+                    prev = oid
+                    self._place_kind(t, kind, price, q)
+                    try: self.api.tpsl_cancel(prev)
+                    except Exception as e: log.warning("tpsl_cancel ancien %s: %s", prev, e)
+                    return "ok"
+                except Exception as e:
+                    log.warning("pose SL avant annulation #%s: %s", t["id"], e)
+            # annulation de l'ancien, CONFIRMÉE, avant toute nouvelle pose (jamais de doublon)
+            try: self.api.tpsl_cancel(oid)
+            except Exception as e: log.warning("tpsl_cancel %s: %s", oid, e)
+            gone = False
+            for _ in range(3):
+                time.sleep(0.4)
+                try:
+                    pend = self.pend(t["position_id"])
+                    if str(oid) not in {str(o.get("id")) for o in pend}:
+                        gone = True; break
+                except Exception as e:
+                    log.warning("tpsl_pending: %s", e)
+            if not gone:
+                log.error("#%s ancien %s %s toujours actif : pas de nouvelle pose", t["id"], kind, oid)
+                return "fail"
+            self._set_oid(t, kind, None)
+            free = self._free_qty(t, kind, pos, pend)
+            q = round_down(min(qty, free), self.qty_prec)
+        if kind == "tp":
+            px = self.price
+            if px and ((t["side"] == "LONG" and px >= price) or (t["side"] == "SHORT" and px <= price)):
+                log.warning("#%s TP %s déjà dépassé (prix %s) : non re-posé", t["id"], price, px); return "fail"
+            if self._tp_limit_live(t):
+                return "ok"
+        if q < self.min_qty:
+            if self._covered(kind, pos, pend):
+                self.db.ev("tpsl_covered", {"trade": t["id"], "kind": kind, "pos": pos}, level="WARNING"); return "covered"
+            self.db.ev("tpsl_no_free_qty", {"trade": t["id"], "kind": kind, "pos": pos, "free": free}, level="WARNING")
+            return "fail"
+        if q + 1e-12 < qty:
+            self.db.ev("tpsl_qty_capped", {"trade": t["id"], "kind": kind, "qty": qty, "capped": q}, level="WARNING")
+        try:
+            self._place_kind(t, kind, price, q)
+            return "ok"
+        except BitunixError as e:
+            c = str(e.code)
+            if c == "30004":
+                return "closed"
+            if c == "30038":   # TP/SL > taille de position : déjà couvert ?
+                try:
+                    pend = self.pend(t["position_id"]); pos = self.pos_qty(t["position_id"])
+                except Exception:
+                    return "fail"
+                if pos <= 0:
+                    return "closed"
+                self.adopt_ids(t, pend)
+                if self.own_tpsl(t, [o for o in pend if self._kind(o) == kind]) or self._covered(kind, pos, pend):
+                    self.db.ev("tpsl_covered", {"trade": t["id"], "kind": kind, "pos": pos, "err": "30038"}, level="WARNING")
+                    return "covered"
+            log.error("pose %s #%s: %s", kind, t["id"], e); return "fail"
+        except Exception as e:
+            log.error("pose %s #%s: %s", kind, t["id"], e); return "fail"
+
+    def _covered(self, kind, pos, pend):
+        return sum(self._oqty(o) for o in pend if self._kind(o) == kind) >= pos - 1e-9
+
+    def _sync(self, t, qty, sl, tp, modify, kinds=("sl", "tp")):
+        """Relit position + ordres en attente, puis synchronise. Retour {kind: statut} ou 'closed'."""
+        if not t.get("position_id"):
+            return {k: "fail" for k in kinds}
+        try:
+            pos = self.pos_qty(t["position_id"]); pend = self.pend(t["position_id"])
+        except Exception as e:
+            log.warning("sync #%s: %s", t["id"], e); return {k: "fail" for k in kinds}
+        if pos <= 0:
+            return "closed"
+        self.adopt_ids(t, pend)
+        out = {}
+        for kind in kinds:
+            r = self._sync_kind(t, kind, sl if kind == "sl" else tp, qty, pos, pend, modify)
+            if r == "closed":
+                return "closed"
+            out[kind] = r
+            try: pend = self.pend(t["position_id"])
+            except Exception: pass
+        return out
+
+    def ensure_tpsl(self, t, kinds=("sl", "tp")):
+        """Pose les ordres manquants du trade (ceux encore vivants ne sont jamais doublés).
+        Retour : 'ok' | 'closed' | 'fail'."""
+        t = self._fresh(t)
+        if not t or t["status"] != "OPEN":
+            return "closed"
+        r = self._sync(t, t["qty"], t["sl"], t["tp"], modify=False, kinds=kinds)
+        if r == "closed":
+            return "closed"
+        return "ok" if all(v in ("ok", "covered") for v in r.values()) else "fail"
+
+    def swap_tpsl(self, t, qty, sl, tp):
+        """Nouveaux prix/qty pour les ordres du trade : modification EN PLACE par orderId ;
+        repli : (SL) pose puis annulation si la qty libre le permet, sinon annulation confirmée puis pose."""
+        t = self._fresh(t)
+        r = self._sync(t, qty, sl, tp, modify=True)
+        if r == "closed":
+            return False, {"sl": False, "tp": False, "closed": True}
+        ok = {k: v in ("ok", "covered") for k, v in r.items()}
+        if r.get("tp") == "fail" and self.price and ((t["side"] == "LONG" and self.price >= tp) or
+                                                     (t["side"] == "SHORT" and self.price <= tp)):
+            ok["tp"] = True   # TP dépassé : géré par le suivi
+        return ok["sl"] and ok["tp"], ok
+
+    def hist_status(self, t):
+        """Statut Bitunix (historique) des ordres propres du trade : {'sl': 'FILLED'|..., 'tp': ...}."""
+        ids = {str(t[f"{k}_order_id"]): k for k in ("sl", "tp") if t.get(f"{k}_order_id")}
+        if not ids:
+            return {}
+        out = {}
+        for o in self.api.tpsl_history(SYMBOL) or []:
+            k = ids.get(str(o.get("id")))
+            if k:
+                out[k] = str(o.get("status") or "").upper()
         return out
 
     def _own_sl_filled(self, t):
-        """True si le SL propre du trade apparaît EXÉCUTÉ dans l'historique TP/SL Bitunix."""
+        """True si le SL propre du trade est EXÉCUTÉ (par orderId ; repli prix pour les anciens trades)."""
         try:
+            if t.get("sl_order_id"):
+                return "FILLED" in self.hist_status(t).get("sl", "")
             hist = self.api.tpsl_history(SYMBOL)
         except Exception as e:
             log.warning("tpsl_history: %s", e); return None
         t0 = datetime.fromisoformat(t["opened_ts"]).timestamp() * 1000 - 60000
+        claimed = self._claimed(exclude=t["id"])
         for o in hist or []:
-            if str(o.get("positionId")) != str(t["position_id"]) or not o.get("slPrice"):
+            if str(o.get("positionId")) != str(t["position_id"]) or not o.get("slPrice") or str(o.get("id")) in claimed:
                 continue
             if abs(float(o["slPrice"]) - t["sl"]) < 0.06 and float(o.get("ctime") or 0) >= t0 and \
                     "FILLED" in str(o.get("status") or "").upper():
                 return True
         return False
 
-    def fix_missing_sl(self, t, mine, live_pos):
-        """v4.1.1 : SL absent -> (a) SL déjà exécuté ? trade clos + TP orphelin annulé ;
-        (b) sinon re-pose immédiate du SL ; (c) prix au-delà du SL ou 2 échecs -> fermeture au marché de SA qty."""
+    def reconcile_closed(self, t):
+        """Position absente / taille 0 / 30004 : trade clos. Prix depuis l'historique de SES ordres."""
+        try: st = self.hist_status(t)
+        except Exception: st = {}
+        if "FILLED" in st.get("sl", ""):
+            return t["sl"], "SL propre exécuté"
+        if "FILLED" in st.get("tp", ""):
+            return t["tp"], "TP propre exécuté"
+        return self.price, "fermée sur l'exchange (SL/TP)"
+
+    def _close_market(self, t, why):
+        """Fermeture au marché de la seule qty du trade (plafonnée à la position). Retour (px, raison) ou None."""
+        try:
+            pos = self.pos_qty(t["position_id"])
+        except Exception as e:
+            log.warning("positions: %s", e); pos = t["qty"]
+        if pos <= 0:
+            return self.reconcile_closed(t)
+        qty = round_down(min(t["qty"], pos), self.qty_prec)
+        self._cancel_own(t)
+        try:
+            if qty >= self.min_qty:
+                self.api.close_qty(t["position_id"], t["side"], qty, self.qty_prec)
+        except BitunixError as e:
+            if str(e.code) == "30004":
+                return self.reconcile_closed(t)
+            self.urgent("no_sl", f"#{t['id']} SANS SL et fermeture au marché ÉCHOUÉE: {e}", key=f"slclosefail:{t['id']}")
+            return None
+        except Exception as e:
+            self.urgent("no_sl", f"#{t['id']} SANS SL et fermeture au marché ÉCHOUÉE: {e}", key=f"slclosefail:{t['id']}")
+            return None
+        self.urgent("no_sl", f"#{t['id']} {why} -> fermé au marché qty {qty}", key=f"slclose:{t['id']}")
+        time.sleep(1.0)
+        self.repair_tpsl(t["position_id"], exclude=t["id"])
+        return self.price, "SL absent : fermé au marché"
+
+    def _cancel_own(self, t):
+        try:
+            live = {str(o.get("id")) for o in self.pend(t["position_id"])}
+        except Exception:
+            live = None
+        for k in ("sl", "tp"):
+            oid = t.get(f"{k}_order_id")
+            if oid and (live is None or str(oid) in live):
+                try: self.api.tpsl_cancel(oid)
+                except Exception as e: log.info("tpsl_cancel %s: %s", oid, e)
+
+    def fix_missing_sl(self, t, live_pos=None):
+        """SL propre absent -> (a) exécuté ? trade clos ; (b) sinon re-pose (qty libre, sans doublon) ;
+        (c) prix au-delà du SL ou 2 échecs -> fermeture au marché de SA qty. 30004/taille 0 = position close."""
         tid = str(t["id"])
         filled = self._own_sl_filled(t)
         if filled:
-            for o in mine:   # TP orphelin : il agirait sur la qty des autres trades
-                try: self.api.tpsl_cancel(o.get("id"))
-                except Exception as e: log.warning("tpsl_cancel orphelin %s: %s", o.get("id"), e)
             self.db.ev("sl_filled_detected", {"trade": t["id"]}, level="WARNING")
             return t["sl"], "SL propre exécuté"
         fails = self.db.get("sl_fix_fail", {}) or {}
         px = self.price
         beyond = px is None or (t["side"] == "LONG" and px <= t["sl"]) or (t["side"] == "SHORT" and px >= t["sl"])
         if not beyond and filled is not None:
-            try:
-                self.api.request("POST", "/api/v1/futures/tpsl/place_order", private=True, retries=1, body={
-                    "symbol": SYMBOL, "positionId": str(t["position_id"]), "slPrice": fmt(t["sl"], self.px_prec),
-                    "slStopType": "MARK_PRICE", "slOrderType": "MARKET", "slQty": fmt(t["qty"], self.qty_prec)})
+            r = self.ensure_tpsl(t, ("sl",))
+            if r == "closed":
+                return self.reconcile_closed(t)
+            if r == "ok":
                 fails.pop(tid, None); self.db.set("sl_fix_fail", fails)
                 self.db.ev("sl_reposed", {"trade": t["id"], "sl": t["sl"], "qty": t["qty"]}, level="WARNING")
-                self.urgent("no_sl", f"#{t['id']} SL absent -> SL {t['sl']} re-posé automatiquement", key=f"slok:{t['id']}")
                 return None
-            except Exception as e:
-                fails[tid] = fails.get(tid, 0) + 1; self.db.set("sl_fix_fail", fails)
-                log.error("re-pose SL #%s échec %d: %s", t["id"], fails[tid], e)
-                if fails[tid] < 2:
-                    return None
+            fails[tid] = fails.get(tid, 0) + 1; self.db.set("sl_fix_fail", fails)
+            log.error("re-pose SL #%s échec %d", t["id"], fails[tid])
+            if fails[tid] < 2:
+                return None
         elif not beyond:
             return None   # historique illisible : on réessaie au prochain tour
-        # fermeture au marché de la seule qty du trade (plafonnée à la position)
-        qty = round_down(min(t["qty"], (live_pos or {}).get(str(t["position_id"]), t["qty"])), self.qty_prec)
-        for o in mine:
-            try: self.api.tpsl_cancel(o.get("id"))
-            except Exception as e: log.warning("tpsl_cancel %s: %s", o.get("id"), e)
-        try:
-            if qty >= self.min_qty:
-                self.api.close_qty(t["position_id"], t["side"], qty, self.qty_prec)
-            fails.pop(tid, None); self.db.set("sl_fix_fail", fails)
-            self.urgent("no_sl", f"#{t['id']} SL non re-posable ({'prix au-delà du SL' if beyond else '2 échecs'}) "
-                                 f"-> fermé au marché qty {qty}", key=f"slclose:{t['id']}")
-            time.sleep(1.0)
-            self.repair_tpsl(t["position_id"], exclude=t["id"])
-            return self.price, "SL absent : fermé au marché"
-        except Exception as e:
-            self.urgent("no_sl", f"#{t['id']} SANS SL et fermeture au marché ÉCHOUÉE: {e}", key=f"slclosefail:{t['id']}")
-            return None
-
-    def repose_tp(self, t, live_pos):
-        """TP propre annulé (ex. SYSTEM_CANCELED après réduction de la position) -> re-pose."""
-        px = self.price
-        if not px or not ((t["side"] == "LONG" and px < t["tp"]) or (t["side"] == "SHORT" and px > t["tp"])):
-            return
-        body = {"symbol": SYMBOL, "positionId": str(t["position_id"]), "tpPrice": fmt(t["tp"], self.px_prec),
-                "tpStopType": "MARK_PRICE", "tpOrderType": "MARKET", "tpQty": fmt(t["qty"], self.qty_prec)}
-        if TP_LIMIT:
-            body["tpOrderType"], body["tpOrderPrice"] = "LIMIT", fmt(t["tp"], self.px_prec)
-        try:
-            self.api.request("POST", "/api/v1/futures/tpsl/place_order", body=body, private=True, retries=1)
-            self.db.ev("tp_reposed", {"trade": t["id"], "tp": t["tp"]}, level="WARNING")
-        except Exception as e:
-            log.error("re-pose TP #%s: %s", t["id"], e)
-
-    def _tp_limit_unfilled(self, t, live_pos):
-        """TP limite déclenché mais pas rempli ? (position pas réduite de la qty du trade) -> sécurise."""
-        pid = str(t["position_id"])
-        expected = sum(o["qty"] for o in self.open_trades() if str(o["position_id"]) == pid)
-        actual = live_pos.get(pid, 0.0)
-        if actual < expected - 0.5 * t["qty"]:
-            return False   # la position a bien été réduite : TP exécuté
-        log.error("#%s : TP/SL disparus mais position non réduite (%.4f >= %.4f) -> TP limite non rempli ?",
-                  t["id"], actual, expected)
-        try:   # annule les ordres limite de clôture restants de ce trade (prix du TP)
-            ids = [o.get("orderId") for o in self.api.pending_orders(SYMBOL)
-                   if str(o.get("positionId")) == pid and o.get("price") and abs(float(o["price"]) - t["tp"]) < 0.06]
-            if ids:
-                self.api.cancel_orders(SYMBOL, order_ids=ids); time.sleep(0.5)
-        except Exception as e:
-            log.warning("pending_orders/cancel: %s", e)
-        self.urgent("no_sl", f"#{t['id']} TP limite déclenché non rempli : SL absent -> re-pose/fermeture", key=f"nosl:{t['id']}")
-        self.replace_tpsl(t)
-        return True
+        fails.pop(tid, None); self.db.set("sl_fix_fail", fails)
+        return self._close_market(t, f"SL non re-posable ({'prix au-delà du SL' if beyond else '2 échecs'})")
 
     def close_live(self, t):
         """Ferme uniquement la part de CE trade si la position exchange est partagée.
-        Qty plafonnée à la taille actuelle de la position ; annule ensuite les TP/SL propres du trade."""
+        Annule d'abord SES ordres (par id), qty plafonnée à la position, puis ré-aligne les autres trades."""
         others = [o for o in self.open_trades() if o["id"] != t["id"] and o["position_id"] == t["position_id"]]
         if not others:
+            self._cancel_own(t)
             return self.api.flash_close(t["position_id"])
-        pos_qty = None
-        for ps in self.api.positions(SYMBOL):
-            if str(ps.get("positionId")) == str(t["position_id"]):
-                pos_qty = float(ps.get("qty") or 0)
+        pos_qty = self.pos_qty(t["position_id"])
         if not pos_qty:
             raise RuntimeError("position introuvable pour fermeture partielle")
-        orders = self.api.tpsl_pending(SYMBOL)
-        mine = self.own_tpsl(t, orders)
-        if not mine:
-            raise RuntimeError("TP/SL propres absents (trade déjà fermé ?) : pas de fermeture partielle")
         qty = round_down(min(t["qty"], pos_qty), self.qty_prec)
         if qty < self.min_qty:
             raise RuntimeError(f"qty de fermeture {qty} < min")
-        # annuler D'ABORD ses propres TP/SL : sinon Bitunix SYSTEM_CANCEL des TP/SL d'autres trades
-        for o in mine:
-            try: self.api.tpsl_cancel(o.get("id"))
-            except Exception as e: log.warning("tpsl_cancel %s: %s", o.get("id"), e)
+        self._cancel_own(t)
         time.sleep(0.5)
         r = self.api.close_qty(t["position_id"], t["side"], qty, self.qty_prec)
         time.sleep(1.0)
@@ -1322,16 +1539,13 @@ class Engine:
         return r
 
     def repair_tpsl(self, position_id, exclude=None):
-        """Re-pose les TP/SL manquants des autres trades ouverts sur la position."""
-        try:
-            pend = self.api.tpsl_pending(SYMBOL)
-        except Exception as e:
-            log.warning("repair tpsl_pending: %s", e); return
+        """Après la sortie/partielle d'un trade : re-pose les ordres des autres trades annulés par Bitunix
+        (SYSTEM_CANCELED), chacun à SA qty, sans doubler ceux encore vivants."""
         for o in self.open_trades():
             if o["id"] == exclude or str(o["position_id"]) != str(position_id):
                 continue
-            if not self.own_tpsl(o, pend):
-                self.replace_tpsl(o)
+            if self.ensure_tpsl(o) == "fail":
+                log.warning("repair #%s : re-pose incomplète (suivi au prochain tour)", o["id"])
 
     def replace_tpsl(self, t):
         px = self.price
@@ -1339,32 +1553,15 @@ class Engine:
                           (t["side"] == "SHORT" and t["tp"] < px < t["sl"]))
         if not ok_side:
             log.error("TP/SL de #%s non re-posables (prix %s hors sl/tp) -> fermeture de sa part", t["id"], px)
-            try:
-                self.api.close_qty(t["position_id"], t["side"], t["qty"], self.qty_prec)
-                self.close_trade(t, px, "TP/SL annulés par Bitunix, fermé au marché")
-            except Exception as e:
-                log.error("close_qty #%s: %s", t["id"], e)
-                self.urgent("no_sl", f"#{t['id']} TP/SL annulés et fermeture au marché échouée: {e}", key=f"nosl:{t['id']}")
-            return
-        try:
-            self.api.tpsl_place(t["position_id"], t["qty"], t["sl"], t["tp"], self.qty_prec, self.px_prec)
+            r = self._close_market(t, "TP/SL absents, prix hors sl/tp")
+            if r:
+                self.close_trade(t, r[0], r[1])
+            return r is not None
+        r = self.ensure_tpsl(t)
+        if r == "closed":
+            self.close_trade(t, *self.reconcile_closed(t)); return True
+        if r == "ok":
             self.db.ev("tpsl_replaced", {"trade": t["id"], "sl": t["sl"], "tp": t["tp"], "qty": t["qty"]}, level="WARNING")
-            return True
-        except Exception as e:
-            log.error("tpsl_place #%s: %s", t["id"], e)
-            self.urgent("no_sl", f"#{t['id']} re-pose TP/SL échouée ({e}) : trade sans SL", key=f"nosl:{t['id']}")
-            return False
-
-    def _tpsl_canceled(self, t):
-        """True si les TP/SL du trade ont été ANNULÉS (pas exécutés) -> on les re-pose, trade reste ouvert."""
-        try:
-            hist = self.own_tpsl(t, self.api.tpsl_history(SYMBOL))
-        except Exception as e:
-            log.warning("tpsl_history: %s", e); return True   # dans le doute, ne pas déclarer fermé
-        st = [str(o.get("status") or "").upper() for o in hist]
-        if st and all("CANCEL" in x for x in st):
-            log.warning("TP/SL de #%s annulés (%s) -> re-pose", t["id"], st)
-            self.replace_tpsl(t)
             return True
         return False
 
@@ -1401,48 +1598,59 @@ class Engine:
                 except Exception as e:
                     log.exception("partielle #%s: %s", t["id"], e)
             if REAL_ORDERS and t["id"] in need:   # re-pose TP/SL après partielle en échec
-                try: mine_now = [o for o in self.api.tpsl_pending(SYMBOL) if str(o.get("positionId")) == str(t["position_id"])]
-                except Exception: mine_now = None
                 fails = self.db.get("need_tpsl_fails", {}) or {}
-                has_be = mine_now is not None and any(o.get("slPrice") and abs(float(o["slPrice"]) - t["sl"]) < 0.06 for o in mine_now)
-                if has_be or self.replace_tpsl(t):
+                ok, part = self.swap_tpsl(t, t["qty"], t["sl"], t["tp"])
+                if part.get("closed"):
+                    need.discard(t["id"]); self.db.set("need_tpsl", sorted(need)); fails.pop(str(t["id"]), None)
+                    self.db.set("need_tpsl_fails", fails)
+                    self.close_trade(t, *self.reconcile_closed(t)); continue
+                if ok:
                     need.discard(t["id"]); self.db.set("need_tpsl", sorted(need)); fails.pop(str(t["id"]), None)
                 else:
                     fails[str(t["id"])] = fails.get(str(t["id"]), 0) + 1
                     if fails[str(t["id"])] >= 3:   # repli : fermeture au marché de la qty restante
-                        try:
-                            self.api.close_qty(t["position_id"], t["side"], t["qty"], self.qty_prec)
-                            need.discard(t["id"]); self.db.set("need_tpsl", sorted(need)); fails.pop(str(t["id"]), None)
-                            self.urgent("no_sl", f"#{t['id']} SL BE non posable (3 échecs) -> reste fermé au marché", key=f"slclose:{t['id']}")
-                            self.close_trade(t, self.price, "SL BE non posable : fermé au marché")
-                        except Exception as e:
-                            self.urgent("no_sl", f"#{t['id']} fermeture de repli échouée: {e}", key=f"slclosefail:{t['id']}")
+                        need.discard(t["id"]); self.db.set("need_tpsl", sorted(need)); fails.pop(str(t["id"]), None)
+                        r = self._close_market(t, "SL BE non posable (3 échecs)")
+                        if r:
+                            self.db.set("need_tpsl_fails", fails)
+                            self.close_trade(t, r[0], r[1]); continue
                 self.db.set("need_tpsl_fails", fails)
                 continue
             if REAL_ORDERS and time.time() < float((self.db.get("partial_guard", {}) or {}).get(str(t["id"]), 0)):
                 continue   # juste après la partielle : TP/SL en cours de remplacement
             if REAL_ORDERS:
-                if live_pos is not None and t["position_id"] and str(t["position_id"]) not in live_pos:
-                    exit_px, reason = self.price, "fermée sur l'exchange (SL/TP)"
-                elif tpsl is not None and live_pos is not None and t["position_id"] and \
-                        time.time() * 1000 - opened_ms > 90000 and not self.own_tpsl(t, tpsl) and \
-                        not self._tpsl_canceled(t):
-                    # ses propres TP/SL ont disparu -> exécutés (position fusionnée toujours ouverte)
-                    hit_sl = abs(self.price - t["sl"]) <= abs(self.price - t["tp"])
-                    if not hit_sl and TP_LIMIT and self._tp_limit_unfilled(t, live_pos):
-                        continue
-                    exit_px, reason = (t["sl"], "SL propre exécuté") if hit_sl else (t["tp"], "TP propre exécuté")
-                elif tpsl is not None and live_pos is not None and t["position_id"] and \
-                        time.time() * 1000 - opened_ms > 90000:
+                pid = str(t["position_id"]) if t["position_id"] else None
+                if live_pos is not None and pid and live_pos.get(pid, 0.0) <= 0:
+                    exit_px, reason = self.reconcile_closed(t)
+                elif tpsl is not None and live_pos is not None and pid and time.time() * 1000 - opened_ms > 90000:
+                    # v4.2.2 : suivi par orderId (plus de rapprochement par prix)
+                    self.adopt_ids(t, tpsl)
                     mine = self.own_tpsl(t, tpsl)
-                    has_sl = any(o.get("slPrice") and abs(float(o["slPrice"]) - t["sl"]) < 0.06 for o in mine)
-                    has_tp = any(o.get("tpPrice") and abs(float(o["tpPrice"]) - t["tp"]) < 0.06 for o in mine)
-                    if mine and not has_sl:
-                        r = self.fix_missing_sl(t, mine, live_pos)
-                        if r:
-                            exit_px, reason = r
-                    elif mine and not has_tp:
-                        self.repose_tp(t, live_pos)
+                    has_sl = any(o.get("slPrice") for o in mine)
+                    has_tp = any(o.get("tpPrice") for o in mine)
+                    if not (has_sl and has_tp):
+                        try: st = self.hist_status(t)
+                        except Exception as e: log.warning("tpsl_history: %s", e); st = None
+                        if st is None:
+                            pass   # historique illisible : on réessaie au prochain tour
+                        elif not has_sl and "FILLED" in st.get("sl", ""):
+                            exit_px, reason = t["sl"], "SL propre exécuté"
+                        elif not has_tp and "FILLED" in st.get("tp", ""):
+                            if self._tp_limit_live(t):
+                                continue   # TP limite déclenché, en carnet : SL toujours là, on attend
+                            exit_px, reason = t["tp"], "TP propre exécuté"
+                        else:
+                            # annulé (ex. SYSTEM_CANCELED après partielle/sortie d'un autre trade) ou inconnu :
+                            # re-pose de SES ordres, à SA qty, sans doublon
+                            if not has_sl:
+                                r = self.fix_missing_sl(t, live_pos)
+                                if r:
+                                    exit_px, reason = r
+                            if exit_px is None and not has_tp:
+                                if self.ensure_tpsl(t, ("tp",)) == "closed":
+                                    exit_px, reason = self.reconcile_closed(t)
+                                else:
+                                    self.db.ev("tp_checked", {"trade": t["id"]})
             else:
                 if t["side"] == "LONG":
                     if lo <= t["sl"]: exit_px, reason = t["sl"], "SL"
@@ -1525,49 +1733,12 @@ class Engine:
         self.after_partial(t, px, pq, rest, maker=False)
         return True
 
-    def swap_tpsl(self, t, mine, qty, sl, tp):
-        """v4.2.1 : remplace les TP/SL d'un trade SANS fenêtre non protégée.
-        1) modification en place (modify_order, même orderId) ; 2) sinon : pose du nouvel ordre PUIS annulation
-        de l'ancien ; 3) si la pose échoue : l'ancien ordre reste en place (protection conservée), retour False."""
-        ok = {"sl": False, "tp": False}
-        olds = {"sl": [o for o in mine if o.get("slPrice")], "tp": [o for o in mine if o.get("tpPrice")]}
-        for kind in ("sl", "tp"):
-            for o in olds[kind][:1]:
-                try:
-                    if kind == "sl": self.api.tpsl_modify_sl(o.get("id"), sl, qty, self.qty_prec, self.px_prec)
-                    else: self.api.tpsl_modify_tp(o.get("id"), tp, qty, self.qty_prec, self.px_prec)
-                    ok[kind] = True
-                    self.db.ev("tpsl_modified", {"trade": t["id"], "kind": kind, "order": o.get("id"),
-                                                 "price": sl if kind == "sl" else tp, "qty": qty})
-                except Exception as e:
-                    log.warning("modify %s #%s: %s -> pose puis annulation", kind, t["id"], e)
-            if ok[kind]:
-                extra = olds[kind][1:]   # doublons éventuels : annulés seulement une fois le principal modifié
-            else:
-                try:
-                    if kind == "sl": self.api.tpsl_place_one(t["position_id"], qty, sl=sl, qprec=self.qty_prec, pprec=self.px_prec)
-                    else: self.api.tpsl_place_one(t["position_id"], qty, tp=tp, qprec=self.qty_prec, pprec=self.px_prec)
-                    ok[kind] = True
-                    self.db.ev("tpsl_placed_before_cancel", {"trade": t["id"], "kind": kind, "qty": qty})
-                except Exception as e:
-                    log.error("pose %s #%s: %s -> ancien ordre conservé", kind, t["id"], e)
-                    continue
-                extra = olds[kind]
-            for o in extra:
-                try: self.api.tpsl_cancel(o.get("id"))
-                except Exception as e: log.warning("tpsl_cancel ancien %s: %s", o.get("id"), e)
-        return ok["sl"] and ok["tp"], ok
-
     def after_partial(self, t, px, pq, rest, maker):
         sg = 1 if t["side"] == "LONG" else -1
         fees = (MAKER_FEE_RATE if maker else FEE_RATE) * pq * px + (MAKER_FEE_RATE if (FEE_MODEL_MAKER and ENTRY_POST_ONLY)
                                                                     else FEE_RATE) * pq * t["entry"]
         ppnl = sg * (px - t["entry"]) * pq - fees
         new_sl = self.be_price(t) if BE_AFTER_PARTIAL else t["sl"]
-        mine = []
-        if REAL_ORDERS:
-            try: mine = self.own_tpsl(t, self.api.tpsl_pending(SYMBOL))   # avec les ANCIENS prix sl/tp
-            except Exception as e: log.warning("tpsl_pending partielle: %s", e)
         self.db.x("UPDATE trades SET partial_done=1, partial_qty=?, partial_px=?, partial_pnl=?, partial_fees=?, "
                   "qty=?, sl=?, margin=? WHERE id=?", (pq, round(px, self.px_prec), round(ppnl, 4), round(fees, 4),
                                                         rest, new_sl, round(rest * t["entry"] / LEVERAGE, 3), t["id"]))
@@ -1576,18 +1747,14 @@ class Engine:
         else:
             g = self.db.get("partial_guard", {}) or {}
             g[str(t["id"])] = time.time() + 45; self.db.set("partial_guard", g)
-            # v4.2.1 : nouveau SL (BE) + TP de la qty restante d'ABORD (modify en place), ancien annulé ENSUITE
+            # v4.2.2 : SES ordres (orderId) modifiés en place à la qty restante ; jamais de doublon
             ok = False
             for _ in range(2):
-                ok, part = self.swap_tpsl(t, mine, rest, new_sl, t["tp"])
-                if ok:
+                ok, part = self.swap_tpsl(t, rest, new_sl, t["tp"])
+                if ok or part.get("closed"):
                     break
                 time.sleep(1.0)
-                try: mine = [o for o in self.api.tpsl_pending(SYMBOL) if str(o.get("positionId")) == str(t["position_id"])
-                             and ((o.get("slPrice") and abs(float(o["slPrice"]) - t["sl"]) < 0.06) or
-                                  (o.get("tpPrice") and abs(float(o["tpPrice"]) - t["tp"]) < 0.06))]
-                except Exception as e: log.warning("tpsl_pending retry: %s", e)
-            if not ok:
+            if not ok and not part.get("closed"):
                 need = set(self.db.get("need_tpsl", []) or []); need.add(t["id"]); self.db.set("need_tpsl", sorted(need))
                 self.urgent("no_sl", f"#{t['id']} partielle faite mais SL BE non posé : nouvel essai", key=f"nosl:{t['id']}")
             time.sleep(0.5)
@@ -1723,6 +1890,8 @@ class Engine:
         if REAL_ORDERS and t.get("partial_cid") and not t.get("partial_done"):
             try: self.api.cancel_orders(SYMBOL, client_ids=[t["partial_cid"]])   # partielle limite orpheline
             except Exception as e: log.info("cancel partielle %s: %s", t["partial_cid"], e)
+        if REAL_ORDERS and t.get("position_id"):
+            self._cancel_own(t)   # v4.2.2 : ordre restant (ex. TP après SL) agirait sur la qty des autres trades
         fees = FEE_RATE * t["qty"] * (t["entry"] + px) + float(t.get("partial_fees") or 0)
         pnl = sgn * (px - t["entry"]) * t["qty"] - FEE_RATE * t["qty"] * (t["entry"] + px) + float(t.get("partial_pnl") or 0)
         self.db.x("UPDATE trades SET status='CLOSED', closed_ts=?, exit=?, pnl=?, fees=?, close_reason=? WHERE id=?",
@@ -1835,7 +2004,7 @@ class Engine:
     def run(self, once=False):
         self.init_exchange()
         self.db.ev("start", {"mode": self.mode, "auto_trade": AUTO_TRADE, "tfs": TIMEFRAMES, "lev": LEVERAGE,
-                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL), "version": "4.2",
+                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL), "version": "4.2.2",
                              "rr": RR, "partial": PARTIAL_TP, "max_fee_share": MAX_FEE_SHARE, "atr_min": ATR_MIN_PCT,
                              "vwap_obv": VWAP_OBV, "kronos": KRONOS_FILTER, "auto_kill": AUTO_KILL,
                              "max_per_tf": MAX_PER_TF})

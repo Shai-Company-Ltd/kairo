@@ -2,6 +2,16 @@
 
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/). Dates en UTC+8.
 
+## [v4.2.2] — 2026-10-24
+### Corrigé (incident du 23/10 22:49–22:51 UTC : TP exécutés deux fois, 30038, SYSTEM_CANCELED, 30004, #56 fermé au marché)
+- Compte Bitunix en mode **HEDGE** : tous les trades d'un même sens partagent un seul `positionId`. Chaque trade (6 max) possède désormais **ses propres ordres** SL et TP, identifiés par **orderId** stocké en base (`trades.sl_order_id`, `trades.tp_order_id`, migration douce). Plus aucun rapprochement par prix (`own_tpsl`, modification, annulation, détection d'exécution via l'historique par id). Les ordres posés avec l'entrée (sans id renvoyé) et les trades ouverts avant v4.2.2 sont **adoptés une seule fois** (même position, même prix, id non revendiqué par un autre trade).
+- Chaque SL/TP est dimensionné à la **qty restante du trade** (après partielle) : ex. A 0,20 + B 0,10 = 0,30 short ; le SL de A ferme 0,20 à son niveau, celui de B 0,10 au sien.
+- Avant toute (re)pose : relecture position + ordres TP/SL en attente (`limit=100`, au lieu de 10 par défaut) ; qty plafonnée à la **qty libre** = taille de position − ordres du même type des autres trades ; un ordre encore vivant n'est **jamais doublé** ; un TP limite déclenché encore en carnet compte comme vivant ; l'ancien TP doit être **confirmé annulé** avant la pose d'un nouveau.
+- `30004` (position inexistante) ou taille 0 = trade clos : réconciliation depuis l'historique (SL/TP propre exécuté sinon prix courant), pas d'alerte `no_sl`. `30038` : si les ordres existants couvrent déjà la position, pas d'alerte ni de fermeture au marché.
+- Ordres `SYSTEM_CANCELED` (après la partielle ou la sortie d'un autre trade) : re-pose des ordres du trade concerné à sa qty, sans doublon. À la clôture d'un trade, ses ordres restants (ex. TP après SL) sont annulés.
+### Ajouté
+- `tests/sim_hedge_v422.py` : simulation hors-ligne de l'incident (bourse factice hedge avec 30038/30004/SYSTEM_CANCELED).
+
 ## [v4.2.1] — 2026-10-23
 ### Corrigé (sécurité, demandé par Risk)
 - Après la partielle à 1R, la position n'est **jamais sans protection** : le SL (break-even + `BE_FEE_PCT`) et le TP de la qty restante sont appliqués **d'abord**, par modification en place (`/api/v1/futures/tpsl/modify_order`, même orderId) ; si la modification échoue, le nouvel ordre est posé **puis** l'ancien annulé ; si la pose échoue, l'ancien ordre reste actif.
