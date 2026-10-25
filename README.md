@@ -96,7 +96,8 @@ L'équipe d'agents n'est pas réveillée à chaque événement :
 | `v4.1.2` | 23/10/2026 | Revue de performance 3 jours sans tokens |
 | `v4.2` | 23/10/2026 | TP 1,5R + partielle 1R + BE, frais 20 %, risque 12 %, filtres ATR%/VWAP-OBV/Kronos, auto-kill |
 | `v4.2.1` | 23/10/2026 | SL/TP modifiés en place après la partielle (jamais sans SL) |
-| `v4.2.2` | 24/10/2026 | Compte HEDGE : SL/TP par trade suivis par orderId, taille = qty du trade, re-pose sans doublon — **en production** |
+| `v4.2.2` | 24/10/2026 | Compte HEDGE : SL/TP par trade suivis par orderId, taille = qty du trade, re-pose sans doublon |
+| `v4.2.3` | 25/10/2026 | Réponses Bitunix dict/liste, adoption de l'ordre existant (jamais de doublon TP/SL), nettoyage auto des orphelins, fin de la boucle de re-pose SL — **en production** |
 
 Changelog détaillé : [CHANGELOG.md](CHANGELOG.md).
 

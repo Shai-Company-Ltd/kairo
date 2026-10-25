@@ -2,6 +2,16 @@
 
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/). Dates en UTC+8.
 
+## [v4.2.3] — 2026-10-25
+### Corrigé (incident du 24/10 : `ERROR pose tp #67: 'list' object has no attribute 'get'`, 33 TP orphelins 0,0012 BTC, boucle `sl_reposed`/`tpsl_covered`, #67 et #68 fermés au marché « SL absent »)
+- Réponse de `tpsl/place_order` lue qu'elle soit un **dict ou une liste** (`_resp_oid` : `{"orderId"}`, `[{"orderId"}]`, `["id"]`, `{"data": …}`) ; l'orderId est enregistré dans `sl_order_id`/`tp_order_id`.
+- **Aucun doublon possible** : avant chaque pose, un ordre existant du même type, même position, même prix et non revendiqué est **adopté** au lieu d'en poser un autre ; après la pose (y compris en cas d'erreur réseau/réponse ambiguë), relecture des ordres TP/SL en attente (`limit=100`) et adoption de l'ordre réellement créé. Seul un refus explicite Bitunix (`BitunixError`) est traité comme « aucun ordre créé ».
+- **Nettoyage automatique des orphelins** (`cleanup_orphans`, au plus 1×/min) : les ordres TP/SL d'une position n'appartenant à aucun `sl_order_id`/`tp_order_id` d'un trade ouvert sont annulés (événement `tpsl_orphan_cancelled`). Garde-fous : ordre vu orphelin à 2 passages successifs, position ignorée si un trade a < 120 s, une partielle en cours (`partial_guard`) ou une re-pose en attente (`need_tpsl`), et un ordre au prix d'un trade sans id pour ce type est adopté, jamais annulé.
+- **Fin de la boucle de re-pose SL** : `fix_missing_sl` relit les ordres et ne fait rien si le SL propre du trade est déjà en place ; `sl_reposed` n'est journalisé que si un nouveau SL propre a réellement été posé.
+- Aucun changement de stratégie, de taille ni de risque.
+### Ajouté
+- `tests/sim_hedge_v423.py` : réponses en liste / liste de scalaires / pose ambiguë (ordre créé puis exception), partielle puis re-pose du TP (une seule pose, 4 ordres au total), 33 TP + 1 SL orphelins annulés, garde-fous, absence de boucle SL. Reproduit l'erreur exacte sur v4.2.2.
+
 ## [v4.2.2] — 2026-10-24
 ### Corrigé (incident du 23/10 22:49–22:51 UTC : TP exécutés deux fois, 30038, SYSTEM_CANCELED, 30004, #56 fermé au marché)
 - Compte Bitunix en mode **HEDGE** : tous les trades d'un même sens partagent un seul `positionId`. Chaque trade (6 max) possède désormais **ses propres ordres** SL et TP, identifiés par **orderId** stocké en base (`trades.sl_order_id`, `trades.tp_order_id`, migration douce). Plus aucun rapprochement par prix (`own_tpsl`, modification, annulation, détection d'exécution via l'historique par id). Les ordres posés avec l'entrée (sans id renvoyé) et les trades ouverts avant v4.2.2 sont **adoptés une seule fois** (même position, même prix, id non revendiqué par un autre trade).

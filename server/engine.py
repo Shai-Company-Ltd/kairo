@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Moteur trading v4.2.2 — BTCUSDT Bitunix USDT-M, isolé, hedge, multi-timeframes.
+"""Moteur trading v4.2.3 — BTCUSDT Bitunix USDT-M, isolé, hedge, multi-timeframes.
 
+v4.2.3 : réponses Bitunix dict OU liste (orderId), adoption de l'ordre existant avant/après chaque pose
+(jamais de doublon même si la pose échoue), nettoyage auto des TP/SL orphelins, fin de la boucle de re-pose SL.
 v4.2.2 : compte HEDGE (positionId partagé) -> chaque trade possède SES ordres SL/TP (orderId en base),
 dimensionnés à SA qty restante ; re-pose plafonnée à la qty libre, jamais de doublon ; 30004/taille 0 = clos.
 v4.2 : TP 1.5R + clôture partielle 50 % à 1R (limite) puis SL au break-even + frais,
@@ -1262,21 +1264,86 @@ class Engine:
             log.warning("pending_orders: %s", e); return True   # dans le doute : pas de doublon
         return False
 
+    @staticmethod
+    def _resp_oid(r):
+        """v4.2.3 : orderId d'une réponse Bitunix, dict OU liste (ex. [{"orderId": ...}]) OU scalaire."""
+        if r is None:
+            return None
+        if isinstance(r, (list, tuple)):
+            for x in r:
+                oid = Engine._resp_oid(x)
+                if oid:
+                    return oid
+            return None
+        if isinstance(r, dict):
+            for k in ("orderId", "id", "tpslOrderId"):
+                if r.get(k):
+                    return str(r[k])
+            for k in ("data", "orderList", "list"):
+                if r.get(k) is not None:
+                    return Engine._resp_oid(r[k])
+            return None
+        if isinstance(r, (str, int)) and str(r).strip():
+            return str(r).strip()
+        return None
+
+    def _match_unclaimed(self, t, kind, price, pend):
+        """Ordre `kind` en attente sur la position du trade, au prix voulu, non revendiqué par un trade ouvert."""
+        claimed = self._claimed(exclude=t["id"])
+        mine = str(t.get(f"{kind}_order_id") or "")
+        c = [o for o in pend or [] if str(o.get("positionId")) == str(t["position_id"]) and self._kind(o) == kind
+             and (str(o.get("id")) == mine or str(o.get("id")) not in claimed) and o.get(f"{kind}Price")
+             and abs(float(o[f"{kind}Price"]) - float(price)) < 0.06]
+        return c
+
+    def _adopt_existing(self, t, kind, price, q, pend, why):
+        """Adopte un ordre existant (prix voulu, non revendiqué) au lieu d'en poser un autre."""
+        c = self._match_unclaimed(t, kind, price, pend)
+        if not c:
+            return False
+        o = min(c, key=lambda o: abs(self._oqty(o) - q))
+        self._set_oid(t, kind, o.get("id"))
+        self.db.ev("tpsl_adopted", {"trade": t["id"], "kind": kind, "order": o.get("id"), "qty": self._oqty(o),
+                                    "why": why})
+        return True
+
     def _place_kind(self, t, kind, price, q):
-        """Pose UN ordre (sl ou tp) de qty q pour le trade et enregistre son orderId."""
-        r = self.api.tpsl_place_one(t["position_id"], q, sl=price if kind == "sl" else None,
-                                    tp=price if kind == "tp" else None, qprec=self.qty_prec, pprec=self.px_prec)
-        oid = str((r or {}).get("orderId") or "") or None
-        self._set_oid(t, kind, oid)
+        """Pose UN ordre (sl ou tp) de qty q pour le trade et enregistre son orderId.
+        v4.2.3 : réponse dict ou liste ; avant la pose, un ordre existant non revendiqué au même prix est adopté ;
+        après la pose (même en cas d'erreur/réponse ambiguë) on relit les ordres en attente (limit=100) et on
+        adopte celui qui existe : une pose ratée ou ambiguë ne peut jamais laisser un doublon."""
         try:
-            time.sleep(0.3)
-            pend = self.pend(t["position_id"])
-            if not oid or oid not in {str(o.get("id")) for o in pend}:
-                self._set_oid(t, kind, None); self.adopt_ids(t, pend)
+            if self._adopt_existing(t, kind, price, q, self.pend(t["position_id"]), "pre_place"):
+                return
         except Exception as e:
-            log.warning("vérif id %s #%s: %s", kind, t["id"], e)
+            log.warning("pré-vérif %s #%s: %s", kind, t["id"], e)
+        err = None
+        try:
+            r = self.api.tpsl_place_one(t["position_id"], q, sl=price if kind == "sl" else None,
+                                        tp=price if kind == "tp" else None, qprec=self.qty_prec, pprec=self.px_prec)
+        except BitunixError:
+            raise   # refus explicite de l'exchange : aucun ordre créé
+        except Exception as e:   # réseau / réponse illisible : l'ordre a PU être créé
+            r, err = None, e
+        oid = self._resp_oid(r)
+        found = False
+        for i in range(3):
+            time.sleep(0.3 * (i + 1))
+            try:
+                pend = self.pend(t["position_id"])
+            except Exception as e:
+                log.warning("vérif id %s #%s: %s", kind, t["id"], e); continue
+            if oid and oid in {str(o.get("id")) for o in pend}:
+                self._set_oid(t, kind, oid); found = True; break
+            if self._adopt_existing(t, kind, price, q, pend, "post_place"):
+                found = True; break
+        if not found:
+            self._set_oid(t, kind, oid)   # id connu mais pas encore visible : gardé (le suivi le revérifie)
         self.db.ev("tpsl_placed", {"trade": t["id"], "kind": kind, "price": price, "qty": q,
-                                   "order": t.get(f"{kind}_order_id")}, level="WARNING")
+                                   "order": t.get(f"{kind}_order_id"), "err": str(err) if err else None},
+                   level="WARNING")
+        if not t.get(f"{kind}_order_id"):
+            raise RuntimeError(f"pose {kind} sans orderId identifiable ({err or 'réponse ambiguë'})")
 
     def _sync_kind(self, t, kind, price, qty, pos, pend, modify):
         """Un ordre (sl/tp) du trade. Retour : 'ok' | 'closed' | 'covered' | 'fail'.
@@ -1502,12 +1569,23 @@ class Engine:
         px = self.price
         beyond = px is None or (t["side"] == "LONG" and px <= t["sl"]) or (t["side"] == "SHORT" and px >= t["sl"])
         if not beyond and filled is not None:
+            try:   # v4.2.3 : SL propre déjà en place (relu) -> rien à faire, pas de boucle sl_reposed
+                pend = self.pend(t["position_id"])
+                self.adopt_ids(t, pend)
+                if any(self._kind(o) == "sl" for o in self.own_tpsl(t, pend)):
+                    fails.pop(tid, None); self.db.set("sl_fix_fail", fails)
+                    return None
+            except Exception as e:
+                log.warning("fix_missing_sl relecture #%s: %s", t["id"], e)
             r = self.ensure_tpsl(t, ("sl",))
             if r == "closed":
                 return self.reconcile_closed(t)
             if r == "ok":
                 fails.pop(tid, None); self.db.set("sl_fix_fail", fails)
-                self.db.ev("sl_reposed", {"trade": t["id"], "sl": t["sl"], "qty": t["qty"]}, level="WARNING")
+                ft = self._fresh(t) or {}
+                if ft.get("sl_order_id") and ft.get("sl_order_id") != t.get("sl_order_id"):
+                    self.db.ev("sl_reposed", {"trade": t["id"], "sl": t["sl"], "qty": t["qty"],
+                                              "order": ft.get("sl_order_id")}, level="WARNING")
                 return None
             fails[tid] = fails.get(tid, 0) + 1; self.db.set("sl_fix_fail", fails)
             log.error("re-pose SL #%s échec %d", t["id"], fails[tid])
@@ -1546,6 +1624,60 @@ class Engine:
                 continue
             if self.ensure_tpsl(o) == "fail":
                 log.warning("repair #%s : re-pose incomplète (suivi au prochain tour)", o["id"])
+
+    def cleanup_orphans(self, force=False):
+        """v4.2.3 : annule les ordres TP/SL d'une position qui n'appartiennent à AUCUN trade ouvert
+        (sl_order_id/tp_order_id). Prudence : positions avec trade récent (<120 s), partielle en cours ou re-pose
+        en attente ignorées ; un ordre doit être vu orphelin à 2 passages successifs (>=60 s) avant annulation ;
+        un ordre au prix d'un trade sans id pour ce type n'est jamais annulé (adopté à la place)."""
+        now = time.time()
+        if not force and now - getattr(self, "_orphan_ts", 0) < 60:
+            return []
+        self._orphan_ts = now
+        opens = [t for t in self.open_trades() if t.get("position_id")]
+        if not opens:
+            self._orphan_seen = set(); return []
+        try:
+            pend = self.pend()
+        except Exception as e:
+            log.warning("orphelins tpsl_pending: %s", e); return []
+        need = set(self.db.get("need_tpsl", []) or [])
+        guard = self.db.get("partial_guard", {}) or {}
+        by_pid = {}
+        for t in opens:
+            by_pid.setdefault(str(t["position_id"]), []).append(t)
+        seen, cancelled = set(), []
+        for pid, trades in by_pid.items():
+            if any(t["id"] in need or now < float(guard.get(str(t["id"]), 0)) or
+                   now - datetime.fromisoformat(t["opened_ts"]).timestamp() < 120 for t in trades):
+                continue
+            ppend = [o for o in pend if str(o.get("positionId")) == pid]
+            for t in trades:
+                self.adopt_ids(t, ppend)
+            trades = [self._fresh(t["id"]) for t in trades]
+            claimed = {str(t[k]) for t in trades for k in ("sl_order_id", "tp_order_id") if t.get(k)}
+            claimed |= self._claimed()
+            for o in ppend:
+                oid = str(o.get("id"))
+                if not o.get("id") or oid in claimed:
+                    continue
+                kind = self._kind(o)
+                if any(not t.get(f"{kind}_order_id") and o.get(f"{kind}Price") and
+                       abs(float(o[f"{kind}Price"]) - float(t[kind])) < 0.06 for t in trades):
+                    continue   # trade sans id pour ce type : candidat à l'adoption, pas un orphelin
+                seen.add(oid)
+                if oid not in getattr(self, "_orphan_seen", set()) and not force:
+                    continue   # 1er passage : confirmé au suivant
+                try:
+                    self.api.tpsl_cancel(oid)
+                    cancelled.append(oid)
+                    self.db.ev("tpsl_orphan_cancelled", {"order": oid, "position": pid, "kind": kind,
+                                                         "price": o.get(f"{kind}Price"), "qty": self._oqty(o)},
+                               level="WARNING")
+                except Exception as e:
+                    log.warning("annulation orphelin %s: %s", oid, e)
+        self._orphan_seen = seen - set(cancelled)
+        return cancelled
 
     def replace_tpsl(self, t):
         px = self.price
@@ -1666,6 +1798,11 @@ class Engine:
                     except Exception as e: log.error("close: %s", e); continue
             if exit_px is not None:
                 self.close_trade(t, exit_px, reason)
+        if REAL_ORDERS and self.open_trades():
+            try:
+                self.cleanup_orphans()
+            except Exception as e:
+                log.warning("cleanup_orphans: %s", e)
 
     # -- v4.2 : clôture partielle à 1R puis SL au break-even + frais
     def r1_price(self, t):
@@ -2004,7 +2141,7 @@ class Engine:
     def run(self, once=False):
         self.init_exchange()
         self.db.ev("start", {"mode": self.mode, "auto_trade": AUTO_TRADE, "tfs": TIMEFRAMES, "lev": LEVERAGE,
-                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL), "version": "4.2.2",
+                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL), "version": "4.2.3",
                              "rr": RR, "partial": PARTIAL_TP, "max_fee_share": MAX_FEE_SHARE, "atr_min": ATR_MIN_PCT,
                              "vwap_obv": VWAP_OBV, "kronos": KRONOS_FILTER, "auto_kill": AUTO_KILL,
                              "max_per_tf": MAX_PER_TF})
