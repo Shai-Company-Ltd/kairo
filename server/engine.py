@@ -112,6 +112,7 @@ POST_ONLY_SUPPORTED = E("POST_ONLY_SUPPORTED", True, bool)  # 0 -> limite GTC si
 ENTRY_TIMEOUT_SEC = E("ENTRY_TIMEOUT_S", E("ENTRY_TIMEOUT_SEC", 60, int), int)   # v4.2.4 : non rempli -> annulé, jamais chassé
 ENTRY_PARTIAL_TIMEOUT_SEC = E("ENTRY_PARTIAL_TIMEOUT_S", 180, int)   # v4.2.4 : partiellement rempli -> reste annulé après ce délai
 ENTRY_WAIT_MANAGE_SEC = E("ENTRY_WAIT_MANAGE_SEC", 10, int)         # v4.2.4 : suivi SL/TP des autres trades pendant l'attente
+ENTRY_PARTIAL_KEEP = E("ENTRY_PARTIAL_KEEP", True, bool)   # v4.2.5 : reste d'un partiel conservé (non bloquant) ; 0 = comportement 4.2.4
 TP_LIMIT = E("TP_LIMIT", True, bool)                    # TP en ordre limite (SL toujours au marché)
 # ---------- v4.2 (chaque nouveauté désactivable)
 MAKER_FEE_RATE = E("MAKER_FEE_RATE", 0.0002, float)    # frais maker (entrée post-only)
@@ -520,7 +521,10 @@ TRADE_COLS_V42 = {"init_sl": "REAL", "orig_qty": "REAL", "partial_done": "INTEGE
                   "partial_px": "REAL", "partial_pnl": "REAL DEFAULT 0", "partial_fees": "REAL DEFAULT 0",
                   "partial_cid": "TEXT",
                   # v4.2.2 : identité des ordres TP/SL par trade (compte HEDGE, positionId partagé)
-                  "sl_order_id": "TEXT", "tp_order_id": "TEXT"}
+                  "sl_order_id": "TEXT", "tp_order_id": "TEXT",
+                  # v4.2.5 : reste de l'ordre d'entrée limite suivi (persistant)
+                  "entry_cid": "TEXT", "entry_pending": "INTEGER DEFAULT 0", "entry_req_qty": "REAL",
+                  "entry_filled": "REAL"}
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -916,7 +920,8 @@ class Engine:
             return f"HALT: {h}"
         if time.time() < self.paused_until():
             return "pause après pertes consécutives"
-        ot = self.open_trades()
+        ot = self.open_trades() + [dict(e, entry=e.get("px"), timeframe=e.get("tf"), id=None)
+                                    for e in self.entry_orders().values()]
         if len(ot) >= MAX_OPEN:
             return f"max {MAX_OPEN} positions"
         if sum(1 for t in ot if t["timeframe"] == tf) >= MAX_PER_TF:
@@ -924,7 +929,7 @@ class Engine:
         for t in ot:
             if t["side"] != side:
                 return "position opposée ouverte (pas de hedge)"
-            if self.price and (self.price - t["entry"]) * (1 if t["side"] == "LONG" else -1) < 0:
+            if self.price and t["entry"] and (self.price - t["entry"]) * (1 if t["side"] == "LONG" else -1) < 0:
                 return "position existante en perte (pas de moyenne à la baisse)"
         eq, d0 = self.realized_equity(), self.day_start_equity()
         if d0 and (d0 - eq) / d0 * 100 >= DAILY_STOP_PCT:
@@ -1006,7 +1011,7 @@ class Engine:
                 skip = "auto-kill: paper (shadow)"
                 self.shadow_open(tf, s, p, sid)
             else:
-                skip = self.can_open(s["side"], tf)
+                skip = self.entry_dup(tf, s["setup"], s["side"]) or self.can_open(s["side"], tf)
             acted = False
             if skip is None and AUTO_TRADE:
                 acted = self.open_trade(tf, s, p, sid)
@@ -1050,6 +1055,8 @@ class Engine:
             if TP_LIMIT:
                 body["tpOrderType"], body["tpOrderPrice"] = "LIMIT", fmt(p["tp"], self.px_prec)
             limit_px = None
+            if ENTRY_POST_ONLY and ENTRY_PARTIAL_KEEP:   # v4.2.5 : pose puis suivi non bloquant (poll_entries)
+                return self._entry_submit_keep(body, tf, s, p, sid, cid)
             if ENTRY_POST_ONLY:
                 r = self._entry_limit(body, side, p, cid)
                 if r is None:
@@ -1110,29 +1117,10 @@ class Engine:
 
     def _entry_limit(self, body, side, p, cid):
         """v4.1 : entrée limite post-only au meilleur prix ; annulée (jamais chassée) après ENTRY_TIMEOUT_SEC.
-        Retourne (prix, qty remplie) ou None."""
-        try:
-            d = self.api.depth(SYMBOL, 1)
-            bid, ask = float(d["bids"][0][0]), float(d["asks"][0][0])
-        except Exception as e:
-            self.urgent("api_error", f"depth() pour entrée limite: {e}", key="depth"); return None
-        px = round(bid if side == "LONG" else ask, self.px_prec)
-        if not ((side == "LONG" and p["sl"] < px < p["tp"]) or (side == "SHORT" and p["tp"] < px < p["sl"])):
-            self.db.ev("entry_skip", {"why": "prix limite hors sl/tp", "px": px, "sl": p["sl"], "tp": p["tp"]}, level="WARNING")
+        Retourne (prix, qty remplie) ou None. (ENTRY_PARTIAL_KEEP=0 : comportement bloquant 4.2.4)"""
+        px = self._entry_submit(body, side, p, cid)
+        if px is None:
             return None
-        body.update({"orderType": "LIMIT", "price": fmt(px, self.px_prec),
-                     "effect": "POST_ONLY" if POST_ONLY_SUPPORTED else "GTC"})
-        self.db.ev("order_send", body)
-        try:
-            self.api.place_order(body)
-        except BitunixError as e:
-            self.db.ev("order_rejected", {"err": str(e)}, level="ERROR")
-            if "post" in str(e).lower():   # post-only qui aurait croisé : normal, pas de chasse
-                self.db.ev("entry_postonly_rejected", {"err": str(e)}, level="WARNING"); return None
-            self.urgent("order_error", f"ordre limite refusé: {e}", key=f"ord:{getattr(e, 'code', '')}")
-            return None
-        except Exception as e:
-            self.db.ev("order_unknown", {"err": str(e), "clientId": cid}, level="ERROR")
         status, tq, det = None, 0.0, {}
         t_start = time.time()
         deadline = t_start + ENTRY_TIMEOUT_SEC
@@ -1155,6 +1143,35 @@ class Engine:
                 deadline = max(deadline, t_start + ENTRY_PARTIAL_TIMEOUT_SEC)
                 self.db.ev("entry_partial_wait", {"clientId": cid, "filled": tq, "qty": body["qty"],
                                                   "timeout_s": ENTRY_PARTIAL_TIMEOUT_SEC})
+        return self._entry_finish(cid, px, body, status, tq, det)
+
+    def _entry_submit(self, body, side, p, cid):
+        """Pose l'ordre limite post-only au meilleur prix. Retourne le prix limite ou None (rien posé)."""
+        try:
+            d = self.api.depth(SYMBOL, 1)
+            bid, ask = float(d["bids"][0][0]), float(d["asks"][0][0])
+        except Exception as e:
+            self.urgent("api_error", f"depth() pour entrée limite: {e}", key="depth"); return None
+        px = round(bid if side == "LONG" else ask, self.px_prec)
+        if not ((side == "LONG" and p["sl"] < px < p["tp"]) or (side == "SHORT" and p["tp"] < px < p["sl"])):
+            self.db.ev("entry_skip", {"why": "prix limite hors sl/tp", "px": px, "sl": p["sl"], "tp": p["tp"]}, level="WARNING")
+            return None
+        body.update({"orderType": "LIMIT", "price": fmt(px, self.px_prec),
+                     "effect": "POST_ONLY" if POST_ONLY_SUPPORTED else "GTC"})
+        self.db.ev("order_send", body)
+        try:
+            self.api.place_order(body)
+        except BitunixError as e:
+            self.db.ev("order_rejected", {"err": str(e)}, level="ERROR")
+            if "post" in str(e).lower():   # post-only qui aurait croisé : normal, pas de chasse
+                self.db.ev("entry_postonly_rejected", {"err": str(e)}, level="WARNING"); return None
+            self.urgent("order_error", f"ordre limite refusé: {e}", key=f"ord:{getattr(e, 'code', '')}")
+            return None
+        except Exception as e:
+            self.db.ev("order_unknown", {"err": str(e), "clientId": cid}, level="ERROR")
+        return px
+
+    def _entry_finish(self, cid, px, body, status, tq, det):
         if status != "FILLED":
             if status not in ("CANCELED", "CANCELLED"):
                 try:
@@ -1184,6 +1201,267 @@ class Engine:
         except (TypeError, ValueError):
             pass
         return px, tq
+
+    # ---------------------------------------------------------------- v4.2.5 : entrée partielle conservée
+    # Ordre d'entrée posé -> kv 'entry_orders' {clientId: contexte} (persistant) ; suivi à chaque tour par
+    # poll_entries() (boucle jamais bloquée). Non rempli à ENTRY_TIMEOUT_SEC -> annulé. Dès un remplissage : le
+    # trade est créé pour la qty remplie (SL/TP propres) ; le RESTE reste en carnet (trades.entry_pending=1) et
+    # chaque remplissage supplémentaire est ajouté au MÊME trade (qty/orig_qty, SL/TP et partielle redimensionnés).
+    # Le reste est annulé : partielle 1R exécutée, trade clos (SL/TP/temps/manuel), kill switch. Jamais de marché.
+    def entry_orders(self):
+        return self.db.get("entry_orders", {}) or {}
+
+    def _entry_save(self, d):
+        self.db.set("entry_orders", d)
+
+    def entry_dup(self, tf, setup, side):
+        """Même setup (tf/setup/sens) déjà en attente (avant remplissage ou reste en carnet) -> pas de 2e ordre."""
+        for e in self.entry_orders().values():
+            if e.get("tf") == tf and e.get("setup") == setup and e.get("side") == side:
+                return "entrée identique en attente"
+        if self.db.q("SELECT id FROM trades WHERE entry_pending=1 AND status='OPEN' AND mode=? AND timeframe=? "
+                     "AND setup=? AND side=?", (self.mode, tf, setup, side)):
+            return "reste d'entrée identique en carnet"
+        return None
+
+    @staticmethod
+    def _det(det):
+        st = str((det or {}).get("status") or "").upper().strip("_")
+        try: tq = float((det or {}).get("tradeQty") or 0)
+        except (TypeError, ValueError): tq = 0.0
+        return st, tq
+
+    def _entry_submit_keep(self, body, tf, s, p, sid, cid):
+        px = self._entry_submit(body, s["side"], p, cid)
+        if px is None:
+            return False
+        d = self.entry_orders()
+        d[cid] = {"tf": tf, "setup": s["setup"], "side": s["side"], "sid": sid, "px": px, "t0": time.time(),
+                  "req_qty": float(body["qty"]), "sl": p["sl"], "tp": p["tp"], "risk_usdt": p["risk_usdt"],
+                  "confidence": s["confidence"], "why": s.get("why", "")}
+        self._entry_save(d)
+        self.db.ev("entry_pending", {"clientId": cid, "px": px, "qty": body["qty"], "tf": tf, "setup": s["setup"]})
+        return True
+
+    def _entry_open(self, cid, e, tq, det, pending):
+        """Crée le trade pour la qty remplie (idempotent par clientId)."""
+        ex = self.db.q("SELECT id FROM trades WHERE client_id=?", (cid,))
+        if ex:
+            return ex[0]["id"]
+        side, entry = e["side"], round(float(e["px"]), self.px_prec)
+        try:
+            ap = float(det.get("avgPrice") or 0)
+            if ap and abs(ap - entry) / entry < 0.02: entry = round(ap, self.px_prec)
+        except (TypeError, ValueError):
+            pass
+        pos_id = None
+        try:
+            for ps in self.api.positions(SYMBOL):
+                if (ps.get("side") or "").upper() in (("BUY", "LONG") if side == "LONG" else ("SELL", "SHORT")):
+                    pos_id = ps.get("positionId")
+        except Exception as ex_:
+            log.warning("positions(): %s", ex_)
+        margin = round(tq * entry / LEVERAGE, 3)
+        tid = self.db.x("INSERT INTO trades(mode,opened_ts,timeframe,setup,side,entry,qty,leverage,margin,sl,tp,"
+                        "risk_usdt,status,client_id,position_id,signal_id,confidence,max_hold_h,init_sl,orig_qty,"
+                        "partial_done,entry_cid,entry_pending,entry_req_qty,entry_filled) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'OPEN',?,?,?,?,?,?,?,0,?,?,?,?)",
+                        (self.mode, now_iso(), e["tf"], e["setup"], side, entry, tq, LEVERAGE, margin, e["sl"], e["tp"],
+                         e["risk_usdt"], cid, pos_id, e.get("sid"), e.get("confidence"), TF_MAX_HOLD_H.get(e["tf"], 24),
+                         e["sl"] if PARTIAL_TP else None, tq, cid, 1 if pending else 0, e["req_qty"], tq)).lastrowid
+        if pending:
+            self.db.ev("entry_partial_keep", {"trade": tid, "clientId": cid, "filled": tq, "qty": e["req_qty"]},
+                       level="WARNING")
+        self.verify_entry_tpsl(tid, partial=tq + 1e-12 < e["req_qty"])
+        if PARTIAL_TP and PARTIAL_LIMIT:
+            self.place_partial_limit(self._fresh(tid))
+            time.sleep(1.0)
+            self.verify_entry_tpsl(tid)
+        self.alert.send({"type": "trade_open", "timeframe": e["tf"], "setup": e["setup"], "side": side,
+                         "price": entry, "sl": e["sl"], "tp": e["tp"], "confidence": e.get("confidence"),
+                         "qty": tq, "margin": margin, "risk_usdt": e["risk_usdt"], "why": e.get("why", ""),
+                         "trade_id": tid, "equity": round(self.equity(), 2),
+                         "open_positions": len(self.open_trades())}, key=f"open:{tid}")
+        return tid
+
+    def _cancel_cid(self, cid):
+        """Annule un ordre limite par clientId puis relit son statut. Retour (statut, qty remplie) ou (None, None)."""
+        try:
+            r = self.api.cancel_orders(SYMBOL, client_ids=[cid])
+            if (r or {}).get("failureList"):
+                log.warning("cancel %s: %s", cid, r.get("failureList"))
+        except Exception as e:
+            log.warning("cancel_orders %s: %s", cid, e)
+        time.sleep(1.0)
+        try:
+            return self._det(self.api.order_detail(cid) or {})
+        except Exception as e:
+            log.warning("order_detail %s après annulation: %s", cid, e); return None, None
+
+    def _entry_cancel_prefill(self, cid, e, why):
+        """Ordre d'entrée sans remplissage (encore) : annulation ; un remplissage de dernière seconde crée le trade."""
+        st, tq = self._cancel_cid(cid)
+        if st is None or st in ("NEW", "INIT", "PART_FILLED", "PARTIALLY_FILLED"):
+            self.urgent("order_error", f"ordre limite {cid} non annulé (statut {st}) : nouvel essai", key=f"ordunk:{cid}")
+            return False
+        tq = round_down(tq, self.qty_prec)
+        if tq >= self.min_qty:
+            self._entry_open(cid, e, tq, {}, pending=False)
+            self.db.ev("entry_partial", {"clientId": cid, "filled": tq, "qty": e["req_qty"], "why": why}, level="WARNING")
+        else:
+            self.db.ev("entry_unfilled", {"clientId": cid, "px": e["px"], "status": st, "timeout_s": ENTRY_TIMEOUT_SEC,
+                                          "why": why})
+        d = self.entry_orders(); d.pop(cid, None); self._entry_save(d)
+        return True
+
+    def poll_entries(self):
+        """Un passage (jamais bloquant) : ordres d'entrée en attente + restes en carnet des trades."""
+        if not REAL_ORDERS:
+            return
+        now = time.time()
+        for cid, e in list(self.entry_orders().items()):
+            try:
+                if self.db.q("SELECT id FROM trades WHERE client_id=?", (cid,)):   # reprise après redémarrage
+                    d = self.entry_orders(); d.pop(cid, None); self._entry_save(d); continue
+                try:
+                    st, tq = self._det(self.api.order_detail(cid) or {})
+                except Exception as ex_:
+                    log.warning("order_detail %s: %s", cid, ex_); st, tq = None, 0.0
+                tq = round_down(tq, self.qty_prec)
+                if tq >= self.min_qty:
+                    final = st == "FILLED" or "CANCEL" in (st or "")
+                    self._entry_open(cid, e, tq, {}, pending=not final)
+                    d = self.entry_orders(); d.pop(cid, None); self._entry_save(d)
+                elif st and "CANCEL" in st:
+                    self.db.ev("entry_unfilled", {"clientId": cid, "px": e["px"], "status": st,
+                                                  "timeout_s": ENTRY_TIMEOUT_SEC})
+                    d = self.entry_orders(); d.pop(cid, None); self._entry_save(d)
+                elif now - float(e.get("t0", 0)) >= ENTRY_TIMEOUT_SEC:
+                    self._entry_cancel_prefill(cid, e, "timeout")
+            except Exception as ex_:
+                log.exception("poll entrée %s: %s", cid, ex_)
+        for t in self.db.q("SELECT * FROM trades WHERE entry_pending=1 AND mode=?", (self.mode,)):
+            try:
+                if t["status"] != "OPEN" or t.get("partial_done") == 1:   # annulation non confirmée : nouvel essai
+                    extra = self.cancel_entry_remainder(t, "trade clos" if t["status"] != "OPEN" else "partielle faite")
+                    if extra and t["status"] == "OPEN":
+                        self._entry_resize(self._fresh(t))
+                    elif extra and t.get("position_id"):
+                        try:
+                            self.api.close_qty(t["position_id"], t["side"], extra, self.qty_prec)
+                            self.urgent("no_sl", f"#{t['id']} reste rempli ({extra}) après clôture : refermé",
+                                        key=f"extra:{t['id']}")
+                        except Exception as e2:
+                            self.urgent("no_sl", f"#{t['id']} reste rempli ({extra}) après clôture, fermeture "
+                                                 f"échouée : {e2}", key=f"extra:{t['id']}")
+                else:
+                    self._entry_track(t)
+            except Exception as ex_:
+                log.exception("suivi reste entrée #%s: %s", t["id"], ex_)
+
+    def _entry_track(self, t):
+        try:
+            st, tq = self._det(self.api.order_detail(t["entry_cid"]) or {})
+        except Exception as e:
+            log.warning("order_detail reste %s: %s", t["entry_cid"], e); return
+        tq = round_down(tq, self.qty_prec)
+        if tq - float(t["entry_filled"] or 0) >= self.min_qty - 1e-12:
+            self._entry_add_fill(t, tq)
+        if st == "FILLED" or "CANCEL" in st:
+            self.db.x("UPDATE trades SET entry_pending=0 WHERE id=?", (t["id"],))
+            self.db.ev("entry_remainder_done", {"trade": t["id"], "status": st, "filled": tq})
+
+    def _entry_add_fill(self, t, tq):
+        """Remplissage supplémentaire du reste -> ajouté au MÊME trade ; SL/TP (même prix) et partielle redimensionnés."""
+        t = self._fresh(t)
+        add = round_down(tq - float(t["entry_filled"] or 0), self.qty_prec)
+        if add < self.min_qty:
+            return
+        qty = round(float(t["qty"]) + add, self.qty_prec)
+        oq = round(float(t["orig_qty"] or 0) + add, self.qty_prec)
+        self.db.x("UPDATE trades SET qty=?, orig_qty=?, entry_filled=?, margin=? WHERE id=?",
+                  (qty, oq, tq, round(qty * t["entry"] / LEVERAGE, 3), t["id"]))
+        self.db.ev("entry_fill_added", {"trade": t["id"], "add": add, "filled": tq, "qty": qty,
+                                        "req": t["entry_req_qty"]}, level="WARNING")
+        if t["status"] != "OPEN":
+            return
+        t = self._fresh(t)
+        if not t.get("position_id"):
+            try:
+                for ps in self.api.positions(SYMBOL):
+                    if (ps.get("side") or "").upper() in (("BUY", "LONG") if t["side"] == "LONG" else ("SELL", "SHORT")):
+                        self.db.x("UPDATE trades SET position_id=? WHERE id=?", (ps.get("positionId"), t["id"]))
+                t = self._fresh(t)
+            except Exception as e:
+                log.warning("positions(): %s", e)
+        self._entry_resize(t)
+
+    def _entry_resize(self, t):
+        """SL/TP du trade à sa nouvelle qty (EN PLACE, même orderId). Les TP/SL éventuellement attachés par Bitunix
+        au nouveau remplissage (même prix, non revendiqués) sont d'abord annulés pour éviter tout doublon."""
+        try:
+            pend = self.pend(t["position_id"])
+            self.adopt_ids(t, pend)
+            t = self._fresh(t)
+            claimed = self._claimed()
+            for o in pend:
+                oid, k = str(o.get("id")), self._kind(o)
+                if oid in claimed or not o.get(f"{k}Price"):
+                    continue
+                if abs(float(o[f"{k}Price"]) - float(t[k])) < 0.06:
+                    try:
+                        self.api.tpsl_cancel(oid)
+                        self.db.ev("entry_extra_tpsl_cancelled", {"trade": t["id"], "order": oid, "kind": k,
+                                                                  "qty": self._oqty(o)})
+                    except Exception as e:
+                        log.warning("annulation tpsl attaché %s: %s", oid, e)
+        except Exception as e:
+            log.warning("resize lecture #%s: %s", t["id"], e)
+        ok, part = self.swap_tpsl(t, t["qty"], t["sl"], t["tp"])
+        if part.get("closed"):
+            return
+        if not ok:
+            need = set(self.db.get("need_tpsl", []) or []); need.add(t["id"]); self.db.set("need_tpsl", sorted(need))
+            self.urgent("no_sl", f"#{t['id']} remplissage ajouté mais SL/TP non redimensionné : nouvel essai",
+                        key=f"resize:{t['id']}")
+        self.db.ev("entry_tpsl_resized", {"trade": t["id"], "qty": t["qty"], "ok": ok})
+        # partielle limite 1R : re-dimensionnée (annulation confirmée sans remplissage, puis nouvelle pose)
+        if PARTIAL_TP and PARTIAL_LIMIT and t.get("partial_cid") and not t.get("partial_done"):
+            st, fq = self._cancel_cid(t["partial_cid"])
+            if st is not None and ("CANCEL" in st) and (fq or 0) <= 0:
+                self.db.x("UPDATE trades SET partial_cid=NULL WHERE id=?", (t["id"],))
+                self.place_partial_limit(self._fresh(t))
+                self.db.ev("partial_limit_resized", {"trade": t["id"], "qty": t["qty"]})
+            # sinon : partielle (en partie) exécutée -> partial_step la traite et annule le reste d'entrée
+
+    def cancel_entry_remainder(self, t, why):
+        """Annule le reste de l'ordre d'entrée du trade. Retour : qty remplie en plus depuis le dernier suivi
+        (déjà ajoutée à qty/orig_qty en base), ou None si l'annulation n'est pas confirmée (nouvel essai au tour suivant)."""
+        t = self._fresh(t)
+        if not t or not t.get("entry_pending"):
+            return 0.0
+        st, tq = self._cancel_cid(t["entry_cid"])
+        if st is None or st in ("NEW", "INIT", "PART_FILLED", "PARTIALLY_FILLED"):
+            self.urgent("order_error", f"#{t['id']} reste d'entrée {t['entry_cid']} non annulé ({st}) : nouvel essai",
+                        key=f"ordunk:{t['entry_cid']}")
+            return None
+        tq = round_down(tq, self.qty_prec)
+        extra = round_down(max(0.0, tq - float(t["entry_filled"] or 0)), self.qty_prec)
+        if extra >= self.min_qty:
+            self.db.x("UPDATE trades SET qty=qty+?, orig_qty=orig_qty+?, entry_filled=? WHERE id=?",
+                      (extra, extra, tq, t["id"]))
+        else:
+            extra = 0.0
+        self.db.x("UPDATE trades SET entry_pending=0 WHERE id=?", (t["id"],))
+        self.db.ev("entry_remainder_cancelled", {"trade": t["id"], "why": why, "status": st, "filled": tq,
+                                                 "req": t["entry_req_qty"], "extra": extra})
+        return extra
+
+    def cancel_all_entries(self, why):
+        for cid, e in list(self.entry_orders().items()):
+            self._entry_cancel_prefill(cid, e, why)
+        for t in self.db.q("SELECT * FROM trades WHERE entry_pending=1 AND mode=?", (self.mode,)):
+            self.cancel_entry_remainder(t, why)
 
     def _entry_wait_tick(self):
         """v4.2.4 : pendant l'attente d'une entrée limite (jusqu'à 3 min), le suivi SL/TP des trades déjà ouverts
@@ -1630,6 +1908,9 @@ class Engine:
     def close_live(self, t):
         """Ferme uniquement la part de CE trade si la position exchange est partagée.
         Annule d'abord SES ordres (par id), qty plafonnée à la position, puis ré-aligne les autres trades."""
+        if t.get("entry_pending"):   # v4.2.5 : reste d'entrée annulé AVANT la fermeture (qty à jour)
+            self.cancel_entry_remainder(t, "fermeture")
+            t = self._fresh(t)
         others = [o for o in self.open_trades() if o["id"] != t["id"] and o["position_id"] == t["position_id"]]
         if not others:
             self._cancel_own(t)
@@ -1674,11 +1955,16 @@ class Engine:
             log.warning("orphelins tpsl_pending: %s", e); return []
         need = set(self.db.get("need_tpsl", []) or [])
         guard = self.db.get("partial_guard", {}) or {}
+        if self.entry_orders():   # v4.2.5 : TP/SL attachés à une entrée sans trade encore : rien n'est orphelin
+            self._orphan_seen = set(); return []
+        keep_pids = {str(r["position_id"]) for r in self.db.q("SELECT position_id FROM trades WHERE entry_pending=1")}
         by_pid = {}
         for t in opens:
             by_pid.setdefault(str(t["position_id"]), []).append(t)
         seen, cancelled = set(), []
         for pid, trades in by_pid.items():
+            if pid in keep_pids:
+                continue   # v4.2.5 : reste d'entrée en carnet (remplissages/TP-SL attachés à venir)
             if any(t["id"] in need or now < float(guard.get(str(t["id"]), 0)) or
                    now - datetime.fromisoformat(t["opened_ts"]).timestamp() < 120 for t in trades):
                 continue
@@ -1903,6 +2189,10 @@ class Engine:
 
     def after_partial(self, t, px, pq, rest, maker):
         sg = 1 if t["side"] == "LONG" else -1
+        if REAL_ORDERS and t.get("entry_pending"):   # v4.2.5 : 1er TP (1R) touché -> reste d'entrée annulé
+            extra = self.cancel_entry_remainder(t, "partielle 1R")
+            if extra:
+                rest = round(rest + extra, self.qty_prec)
         fees = (MAKER_FEE_RATE if maker else FEE_RATE) * pq * px + (MAKER_FEE_RATE if (FEE_MODEL_MAKER and ENTRY_POST_ONLY)
                                                                     else FEE_RATE) * pq * t["entry"]
         ppnl = sg * (px - t["entry"]) * pq - fees
@@ -2055,6 +2345,15 @@ class Engine:
 
     def close_trade(self, t, px, reason):
         sgn = 1 if t["side"] == "LONG" else -1
+        if REAL_ORDERS and t.get("entry_pending"):   # v4.2.5 : trade clos (SL/TP/temps/kill) -> reste annulé
+            extra = self.cancel_entry_remainder(t, reason)
+            if extra and t.get("position_id"):   # rempli entre le dernier suivi et l'annulation : exposition à retirer
+                try:
+                    self.api.close_qty(t["position_id"], t["side"], extra, self.qty_prec)
+                    self.urgent("no_sl", f"#{t['id']} reste rempli ({extra}) après clôture : refermé", key=f"extra:{t['id']}")
+                except Exception as e:
+                    self.urgent("no_sl", f"#{t['id']} reste rempli ({extra}) après clôture, fermeture échouée : {e}",
+                                key=f"extra:{t['id']}")
         if REAL_ORDERS and t.get("partial_cid") and not t.get("partial_done"):
             try: self.api.cancel_orders(SYMBOL, client_ids=[t["partial_cid"]])   # partielle limite orpheline
             except Exception as e: log.info("cancel partielle %s: %s", t["partial_cid"], e)
@@ -2084,6 +2383,9 @@ class Engine:
         eq = self.equity() if eq is None else eq
         if not self.halted() and eq <= KILL_EQUITY:
             self.db.set("halted", f"kill switch equity {eq:.2f} <= {KILL_EQUITY}")
+            if REAL_ORDERS:
+                try: self.cancel_all_entries("kill switch")   # v4.2.5 : ordres d'entrée / restes annulés d'abord
+                except Exception as e: log.error("kill switch annulation entrées: %s", e)
             for t in self.open_trades():
                 if REAL_ORDERS and t["position_id"]:
                     try: self.api.flash_close(t["position_id"])
@@ -2157,6 +2459,10 @@ class Engine:
     def step(self):
         for tf in self.refresh():
             self.on_close(tf)
+        try:
+            self.poll_entries()   # v4.2.5 : entrées en attente / restes en carnet (non bloquant)
+        except Exception as e:
+            log.exception("poll_entries: %s", e)
         self.manage()
         if AUTO_KILL:
             try:
@@ -2172,10 +2478,12 @@ class Engine:
     def run(self, once=False):
         self.init_exchange()
         self.db.ev("start", {"mode": self.mode, "auto_trade": AUTO_TRADE, "tfs": TIMEFRAMES, "lev": LEVERAGE,
-                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL), "version": "4.2.4",
+                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL), "version": "4.2.5",
                              "rr": RR, "partial": PARTIAL_TP, "max_fee_share": MAX_FEE_SHARE, "atr_min": ATR_MIN_PCT,
                              "vwap_obv": VWAP_OBV, "kronos": KRONOS_FILTER, "auto_kill": AUTO_KILL,
-                             "max_per_tf": MAX_PER_TF})
+                             "max_per_tf": MAX_PER_TF, "entry_partial_keep": ENTRY_PARTIAL_KEEP,
+                             "entries_pending": len(self.entry_orders()),
+                             "remainders_pending": len(self.db.q("SELECT id FROM trades WHERE entry_pending=1"))})
         if CONTROL_PORT and not once:
             start_control(self)
         if not once and E("STARTUP_ALERT", False, bool):

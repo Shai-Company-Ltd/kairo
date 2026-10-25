@@ -8,6 +8,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 src = open(os.path.join(HERE, "sim_hedge_v422.py")).read().split("\nA = new_trade(")[0]
 exec(compile(src.replace("__file__", repr(os.path.join(HERE, "x.py"))), "sim_v422_base", "exec"))
 
+E.ENTRY_PARTIAL_KEEP = False   # v4.2.5 : ce test couvre le repli 4.2.4 (ENTRY_PARTIAL_KEEP=0)
 ok(E.ENTRY_TIMEOUT_SEC == 60 and E.ENTRY_PARTIAL_TIMEOUT_SEC == 180, "défauts 60 s / 180 s")
 
 clock = [time.time()]

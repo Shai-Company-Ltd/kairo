@@ -60,7 +60,7 @@ flowchart LR
   - `rsi_reversal` — retournement sur RSI extrême.
 - **Timeframes** : 5m, 15m, 1h, 4h, 1d pour le trading ; le 1m reste en contexte.
 - **Confiance** : chaque signal a un score ; trade au-dessus de `MIN_CONF_TRADE`, alerte au-dessus de `MIN_CONF_ALERT`.
-- **Exécution** : entrée limite post-only au meilleur prix, annulée si non remplie en 60 s (`ENTRY_TIMEOUT_S`) ; dès un remplissage partiel, attente jusqu'à 180 s (`ENTRY_PARTIAL_TIMEOUT_S`) puis reste annulé, partie remplie conservée (jamais chassée, jamais au marché) ; le suivi SL/TP des autres trades continue pendant l'attente ; TP en limite, SL au marché.
+- **Exécution** : entrée limite post-only au meilleur prix, annulée si non remplie en 60 s (`ENTRY_TIMEOUT_S`) ; v4.2.5 (`ENTRY_PARTIAL_KEEP=1`) : dès un remplissage partiel le trade est créé pour la qty remplie et le reste reste en carnet, chaque remplissage supplémentaire agrandit le même trade (SL/TP et partielle redimensionnés) ; reste annulé à la partielle 1R/TP, à la clôture ou au kill switch ; suivi non bloquant et persistant (redémarrage) ; jamais au marché ; TP en limite, SL au marché. `ENTRY_PARTIAL_KEEP=0` : comportement 4.2.4 (reste annulé à 180 s, `ENTRY_PARTIAL_TIMEOUT_S`).
 
 ## 🛡️ Gestion du risque
 
@@ -97,7 +97,8 @@ L'équipe d'agents n'est pas réveillée à chaque événement :
 | `v4.2` | 23/10/2026 | TP 1,5R + partielle 1R + BE, frais 20 %, risque 12 %, filtres ATR%/VWAP-OBV/Kronos, auto-kill |
 | `v4.2.1` | 23/10/2026 | SL/TP modifiés en place après la partielle (jamais sans SL) |
 | `v4.2.2` | 24/10/2026 | Compte HEDGE : SL/TP par trade suivis par orderId, taille = qty du trade, re-pose sans doublon |
-| `v4.2.4` | 25/10/2026 | Délais d'entrée limite 60 s / 180 s si partiel (configurables), suivi SL/TP non bloqué pendant l'attente — **en production** |
+| `v4.2.4` | 25/10/2026 | Délais d'entrée limite 60 s / 180 s si partiel (configurables), suivi SL/TP non bloqué pendant l'attente |
+| `v4.2.5` | 25/10/2026 | Reste d'une entrée partielle conservé en carnet et ajouté au même trade (`ENTRY_PARTIAL_KEEP`), boucle non bloquante, état persistant — **en production** |
 | `v4.2.3` | 25/10/2026 | Réponses Bitunix dict/liste, adoption de l'ordre existant (jamais de doublon TP/SL), nettoyage auto des orphelins, fin de la boucle de re-pose SL |
 
 Changelog détaillé : [CHANGELOG.md](CHANGELOG.md).
@@ -147,6 +148,7 @@ Tout passe par `.env` (modèle : [`.env.example`](.env.example)). Points clés :
 | `WEBHOOK_URL/KEY` | Point d'entrée de l'équipe d'agents |
 | `WEBHOOK_BATCH`, `BATCH_HOURS` | Récaps groupés |
 | `ADX_FILTER`, `ENTRY_POST_ONLY`, `TP_LIMIT` | Nouveautés v4.1 (0 = désactivé) |
+| `ENTRY_PARTIAL_KEEP` | v4.2.5 : 1 = reste d'entrée partielle conservé (défaut), 0 = annulé à `ENTRY_PARTIAL_TIMEOUT_S` (4.2.4) |
 | `RISK_PCT`, `RR`, `PARTIAL_TP`, `BE_AFTER_PARTIAL`, `MAX_PER_TF` | Risque 12 %, TP 1,5R, partielle 50 % à 1R, BE + frais (v4.2) |
 | `ATR_FILTER`/`ATR_MIN_PCT`, `BREAKOUT5M_STRICT`, `VWAP_OBV`, `KRONOS_FILTER`, `AUTO_KILL` | Filtres et auto-kill v4.2 (0 / off = désactivé) |
 

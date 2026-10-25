@@ -2,6 +2,19 @@
 
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/). Dates en UTC+8.
 
+## [v4.2.5] — 2026-10-25
+### Modifié
+- **Entrée partielle conservée** (`ENTRY_PARTIAL_KEEP=1`, défaut ; `0` = comportement 4.2.4). Non rempli à 60 s → annulé (inchangé). Dès un remplissage, le trade est créé pour la qty remplie avec ses SL/TP propres ; le **reste de l'ordre limite reste en carnet sans délai** (`trades.entry_pending=1`, événement `entry_partial_keep`).
+- Chaque remplissage supplémentaire est ajouté au **même trade** (`qty`, `orig_qty`, `entry_filled`) ; ses SL/TP sont redimensionnés **en place** (même orderId, mêmes prix) et la partielle limite 1R est ré-posée à la nouvelle taille (`entry_fill_added`, `entry_tpsl_resized`, `partial_limit_resized`). Les TP/SL éventuellement attachés par Bitunix au nouveau remplissage (même prix, non revendiqués) sont annulés avant le redimensionnement (`entry_extra_tpsl_cancelled`) : jamais de doublon.
+- Le reste est annulé (`entry_remainder_cancelled`) : partielle 1R exécutée (ou TP s'il n'y a pas de partielle), trade clos de toute façon (SL, TP, temps max, manuel), kill switch. Annulation confirmée par relecture ; une qty remplie à la dernière seconde est ajoutée au trade (ou refermée si le trade est déjà clos, avec alerte). Annulation non confirmée → nouvel essai au tour suivant.
+- **Boucle principale non bloquante** : l'ordre est posé puis suivi à chaque tour (`poll_entries`) ; état persistant (`kv.entry_orders` avant remplissage, colonnes `entry_cid/entry_pending/entry_req_qty/entry_filled` ensuite, migration douce) repris au redémarrage.
+- Nettoyage des orphelins : position avec un reste en carnet ignorée ; suspendu tant qu'une entrée sans trade est en attente. L'ordre d'entrée lui-même n'est jamais touché.
+- Limites : une entrée en attente compte comme une position (`MAX_OPEN`, `MAX_PER_TF`, sens opposé) ; pas de 2e ordre pour le même tf/setup/sens tant qu'une entrée ou un reste est en attente.
+- Jamais d'entrée au marché. Aucun changement de stratégie, de taille ni de seuils.
+### Ajouté
+- `tests/sim_entry_partial_keep.py` : partiel puis 1R → reste annulé ; partiel puis SL → reste annulé ; remplissage supplémentaire → SL/TP + partielle redimensionnés sans doublon ; boucle libre ; redémarrage (avant et après remplissage, idempotent) ; orphelins ; kill switch ; aucun ordre au marché ; repli `ENTRY_PARTIAL_KEEP=0`.
+- `tests/sim_entry_timeout.py` force `ENTRY_PARTIAL_KEEP=0` (il couvre le repli 4.2.4).
+
 ## [v4.2.4] — 2026-10-25
 ### Modifié
 - Entrée limite POST_ONLY : délai porté de 20 s à **60 s** sans remplissage (`ENTRY_TIMEOUT_S`, ancien nom `ENTRY_TIMEOUT_SEC` encore lu en repli) et **180 s** depuis la pose dès qu'un remplissage partiel est constaté (`ENTRY_PARTIAL_TIMEOUT_S`, événement `entry_partial_wait`). Rempli entièrement pendant l'attente → trade normal ; à l'échéance → reste annulé, partie remplie conservée (`entry_partial`, comme avant). Jamais d'entrée au marché, jamais chassée.
