@@ -156,6 +156,14 @@ log = logging.getLogger("v4")
 # ---------------------------------------------------------------- Bitunix client
 BASE = "https://fapi.bitunix.com"
 
+def account_equity(a, include_frozen=True):
+    """Equity totale Bitunix (v4.2.6) = available + margin (positions) + frozen (ordres en attente)
+    + PnL latent cross + isolé. include_frozen=False = ancienne formule (utilisée pour la taille)."""
+    f = lambda k: float(a.get(k, 0) or 0)
+    eq = f("available") + f("margin") + f("crossUnrealizedPNL") + f("isolationUnrealizedPNL")
+    return eq + f("frozen") if include_frozen else eq
+
+
 class BitunixError(Exception):
     def __init__(self, code, msg, path=""):
         super().__init__(f"{path} code={code} msg={msg}")
@@ -742,9 +750,9 @@ class Engine:
             try:
                 a = self.api.account()
                 a = a[0] if isinstance(a, list) else a
-                eq = float(a.get("available", 0)) + float(a.get("margin", 0)) + \
-                     float(a.get("crossUnrealizedPNL", 0) or 0) + float(a.get("isolationUnrealizedPNL", 0) or 0)
+                eq = account_equity(a, include_frozen=True)
                 self.db.set("live_equity", eq)
+                self._sizing_eq = account_equity(a, include_frozen=False)
                 return eq
             except Exception as e:
                 log.warning("account(): %s", e)
@@ -757,6 +765,14 @@ class Engine:
 
     def realized_equity(self):
         return self.db.get("paper_equity", START_EQUITY) if not REAL_ORDERS else self.equity()
+
+    def sizing_equity(self):
+        """v4.2.6 : base de taille INCHANGÉE (available + margin + PnL latent, sans 'frozen')."""
+        if not REAL_ORDERS:
+            return self.realized_equity()
+        self._sizing_eq = None
+        eq = self.equity()
+        return self._sizing_eq if self._sizing_eq is not None else eq
 
     def open_trades(self):
         return self.db.q("SELECT * FROM trades WHERE status='OPEN' AND mode=?", (self.mode,))
@@ -950,7 +966,7 @@ class Engine:
         sl_dist = max(ATR_SL_MULT * a["atr"], px * MIN_SL_PCT / 100)
         sgn = 1 if side == "LONG" else -1
         sl, tp = px - sgn * sl_dist, px + sgn * RR * sl_dist
-        eq = self.realized_equity()
+        eq = self.sizing_equity()
         risk = eq * RISK_PCT / 100
         qty = risk / sl_dist
         max_qty = eq * MAX_MARGIN_PCT / 100 * LEVERAGE / px
@@ -2478,7 +2494,7 @@ class Engine:
     def run(self, once=False):
         self.init_exchange()
         self.db.ev("start", {"mode": self.mode, "auto_trade": AUTO_TRADE, "tfs": TIMEFRAMES, "lev": LEVERAGE,
-                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL), "version": "4.2.5",
+                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL), "version": "4.2.6",
                              "rr": RR, "partial": PARTIAL_TP, "max_fee_share": MAX_FEE_SHARE, "atr_min": ATR_MIN_PCT,
                              "vwap_obv": VWAP_OBV, "kronos": KRONOS_FILTER, "auto_kill": AUTO_KILL,
                              "max_per_tf": MAX_PER_TF, "entry_partial_keep": ENTRY_PARTIAL_KEEP,

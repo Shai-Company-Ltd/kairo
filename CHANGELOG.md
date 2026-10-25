@@ -2,6 +2,15 @@
 
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/). Dates en UTC+8.
 
+## [v4.2.6] — 2026-10-25
+### Corrigé (fausse alerte du 25/10 15:15 UTC : « drawdown du jour 26.4% (1000.25 -> 736.12) » à la pose de l'entrée #74)
+- L'equity Bitunix ignorait le champ `frozen` (marge gelée des ordres en attente) : pendant qu'un ordre d'entrée limite était en carnet, l'equity tombait à `available` seul. Nouvelle fonction `account_equity()` : **equity = available + margin + frozen + crossUnrealizedPNL + isolationUnrealizedPNL**.
+- Cette equity totale est utilisée pour le drawdown du jour, le stop journalier, le kill switch (`KILL_EQUITY`), le digest, le heartbeat, les alertes et la référence de début de journée (`day_start`).
+- **Taille des positions inchangée** : `plan()` utilise `sizing_equity()` = ancienne base (available + margin + PnL latent, sans `frozen`) et garde le plafond sur la marge disponible.
+- Aucun changement de stratégie.
+### Ajouté
+- `tests/sim_equity_total.py` : reproduit 736.12 avec l'ancienne formule, vérifie l'absence d'alerte drawdown, l'equity avec position ouverte, le kill switch et une taille identique à v4.2.5.
+
 ## [v4.2.5] — 2026-10-25
 ### Modifié
 - **Entrée partielle conservée** (`ENTRY_PARTIAL_KEEP=1`, défaut ; `0` = comportement 4.2.4). Non rempli à 60 s → annulé (inchangé). Dès un remplissage, le trade est créé pour la qty remplie avec ses SL/TP propres ; le **reste de l'ordre limite reste en carnet sans délai** (`trades.entry_pending=1`, événement `entry_partial_keep`).
