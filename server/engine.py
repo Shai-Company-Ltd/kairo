@@ -109,7 +109,9 @@ ADX_PERIOD = E("ADX_PERIOD", 14, int)
 ADX_MIN = E("ADX_MIN", 20.0, float)
 ENTRY_POST_ONLY = E("ENTRY_POST_ONLY", True, bool)      # entrée limite post-only au meilleur prix
 POST_ONLY_SUPPORTED = E("POST_ONLY_SUPPORTED", True, bool)  # 0 -> limite GTC simple au meilleur prix
-ENTRY_TIMEOUT_SEC = E("ENTRY_TIMEOUT_SEC", 20, int)     # non rempli -> annulé, jamais chassé
+ENTRY_TIMEOUT_SEC = E("ENTRY_TIMEOUT_S", E("ENTRY_TIMEOUT_SEC", 60, int), int)   # v4.2.4 : non rempli -> annulé, jamais chassé
+ENTRY_PARTIAL_TIMEOUT_SEC = E("ENTRY_PARTIAL_TIMEOUT_S", 180, int)   # v4.2.4 : partiellement rempli -> reste annulé après ce délai
+ENTRY_WAIT_MANAGE_SEC = E("ENTRY_WAIT_MANAGE_SEC", 10, int)         # v4.2.4 : suivi SL/TP des autres trades pendant l'attente
 TP_LIMIT = E("TP_LIMIT", True, bool)                    # TP en ordre limite (SL toujours au marché)
 # ---------- v4.2 (chaque nouveauté désactivable)
 MAKER_FEE_RATE = E("MAKER_FEE_RATE", 0.0002, float)    # frais maker (entrée post-only)
@@ -1132,9 +1134,15 @@ class Engine:
         except Exception as e:
             self.db.ev("order_unknown", {"err": str(e), "clientId": cid}, level="ERROR")
         status, tq, det = None, 0.0, {}
-        deadline = time.time() + ENTRY_TIMEOUT_SEC
+        t_start = time.time()
+        deadline = t_start + ENTRY_TIMEOUT_SEC
+        partial_seen = False
+        last_manage = t_start
         while time.time() < deadline:
             time.sleep(2)
+            if time.time() - last_manage >= ENTRY_WAIT_MANAGE_SEC:
+                last_manage = time.time()
+                self._entry_wait_tick()
             try:
                 det = self.api.order_detail(cid) or {}
                 status, tq = str(det.get("status") or "").upper().strip("_"), float(det.get("tradeQty") or 0)
@@ -1142,6 +1150,11 @@ class Engine:
                 log.warning("order_detail %s: %s", cid, e); continue
             if status in ("FILLED", "CANCELED", "CANCELLED"):
                 break
+            if not partial_seen and tq > 0:   # v4.2.4 : partiel -> on laisse jusqu'à ENTRY_PARTIAL_TIMEOUT_SEC
+                partial_seen = True
+                deadline = max(deadline, t_start + ENTRY_PARTIAL_TIMEOUT_SEC)
+                self.db.ev("entry_partial_wait", {"clientId": cid, "filled": tq, "qty": body["qty"],
+                                                  "timeout_s": ENTRY_PARTIAL_TIMEOUT_SEC})
         if status != "FILLED":
             if status not in ("CANCELED", "CANCELLED"):
                 try:
@@ -1164,12 +1177,30 @@ class Engine:
             self.db.ev("entry_unfilled", {"clientId": cid, "px": px, "status": status, "timeout_s": ENTRY_TIMEOUT_SEC})
             return None
         if status != "FILLED":
-            self.db.ev("entry_partial", {"clientId": cid, "filled": tq, "qty": body["qty"]}, level="WARNING")
+            self.db.ev("entry_partial", {"clientId": cid, "filled": tq, "qty": body["qty"],
+                                         "timeout_s": ENTRY_PARTIAL_TIMEOUT_SEC}, level="WARNING")
         try:
             px = float(det.get("avgPrice") or det.get("price") or px)
         except (TypeError, ValueError):
             pass
         return px, tq
+
+    def _entry_wait_tick(self):
+        """v4.2.4 : pendant l'attente d'une entrée limite (jusqu'à 3 min), le suivi SL/TP des trades déjà ouverts
+        continue. Le nettoyage des orphelins est suspendu (les TP/SL attachés à l'entrée en cours n'ont pas
+        encore de trade en base et ne doivent pas être annulés)."""
+        self._entry_pending = True
+        try:
+            try:
+                d = self.api.depth(SYMBOL, 1)
+                self.price = round((float(d["bids"][0][0]) + float(d["asks"][0][0])) / 2, self.px_prec)
+            except Exception:
+                pass
+            self.manage()
+        except Exception as e:
+            log.exception("manage pendant attente entrée: %s", e)
+        finally:
+            self._entry_pending = False
 
     def verify_entry_tpsl(self, tid, partial=False):
         """Après ouverture : le trade doit avoir SON SL (et TP) sur Bitunix ; sinon on les pose.
@@ -1798,7 +1829,7 @@ class Engine:
                     except Exception as e: log.error("close: %s", e); continue
             if exit_px is not None:
                 self.close_trade(t, exit_px, reason)
-        if REAL_ORDERS and self.open_trades():
+        if REAL_ORDERS and self.open_trades() and not getattr(self, "_entry_pending", False):
             try:
                 self.cleanup_orphans()
             except Exception as e:
@@ -2141,7 +2172,7 @@ class Engine:
     def run(self, once=False):
         self.init_exchange()
         self.db.ev("start", {"mode": self.mode, "auto_trade": AUTO_TRADE, "tfs": TIMEFRAMES, "lev": LEVERAGE,
-                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL), "version": "4.2.3",
+                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL), "version": "4.2.4",
                              "rr": RR, "partial": PARTIAL_TP, "max_fee_share": MAX_FEE_SHARE, "atr_min": ATR_MIN_PCT,
                              "vwap_obv": VWAP_OBV, "kronos": KRONOS_FILTER, "auto_kill": AUTO_KILL,
                              "max_per_tf": MAX_PER_TF})

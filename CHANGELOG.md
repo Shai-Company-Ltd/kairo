@@ -2,6 +2,14 @@
 
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/). Dates en UTC+8.
 
+## [v4.2.4] — 2026-10-25
+### Modifié
+- Entrée limite POST_ONLY : délai porté de 20 s à **60 s** sans remplissage (`ENTRY_TIMEOUT_S`, ancien nom `ENTRY_TIMEOUT_SEC` encore lu en repli) et **180 s** depuis la pose dès qu'un remplissage partiel est constaté (`ENTRY_PARTIAL_TIMEOUT_S`, événement `entry_partial_wait`). Rempli entièrement pendant l'attente → trade normal ; à l'échéance → reste annulé, partie remplie conservée (`entry_partial`, comme avant). Jamais d'entrée au marché, jamais chassée.
+- Attente non bloquante pour la protection : toutes les `ENTRY_WAIT_MANAGE_SEC` (10 s) pendant l'attente, `manage()` suit les SL/TP des trades déjà ouverts (prix rafraîchi via le carnet) ; le nettoyage des orphelins est suspendu pendant l'attente (les TP/SL attachés à l'entrée en cours n'ont pas encore de trade en base).
+- Aucun changement de stratégie, de taille ni de seuils.
+### Ajouté
+- `tests/sim_entry_timeout.py` : horloge virtuelle — non rempli annulé à 60 s, partiel annulé à 180 s (qty gardée), complété pendant l'attente, partiel tardif, un seul ordre LIMIT POST_ONLY, suivi des autres trades pendant l'attente, aucun nettoyage d'orphelins.
+
 ## [v4.2.3] — 2026-10-25
 ### Corrigé (incident du 24/10 : `ERROR pose tp #67: 'list' object has no attribute 'get'`, 33 TP orphelins 0,0012 BTC, boucle `sl_reposed`/`tpsl_covered`, #67 et #68 fermés au marché « SL absent »)
 - Réponse de `tpsl/place_order` lue qu'elle soit un **dict ou une liste** (`_resp_oid` : `{"orderId"}`, `[{"orderId"}]`, `["id"]`, `{"data": …}`) ; l'orderId est enregistré dans `sl_order_id`/`tp_order_id`.
