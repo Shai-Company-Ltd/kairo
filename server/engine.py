@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Moteur trading v4.2.7 — (v4.2.7 : positions/ordres MANUELS jamais touchés : orphelins = seulement ordres du moteur, qty étrangère protégée, flash_close interdit si position fusionnée, taille hors marge manuelle)
+"""Moteur trading v4.3.0 — (v4.3.0 : filtre de tendance par TF, filtres de marché feeds.py fail-open, TP net >= 2x frais, risque 3 %)
+Moteur trading v4.2.7 — (v4.2.7 : positions/ordres MANUELS jamais touchés : orphelins = seulement ordres du moteur, qty étrangère protégée, flash_close interdit si position fusionnée, taille hors marge manuelle)
 Moteur trading v4.2.3 — BTCUSDT Bitunix USDT-M, isolé, hedge, multi-timeframes.
 
 v4.2.3 : réponses Bitunix dict OU liste (orderId), adoption de l'ordre existant avant/après chaque pose
@@ -32,6 +33,10 @@ import os, sys, time, json, math, hashlib, secrets, sqlite3, signal, logging, th
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
+try:
+    import feeds as _feeds   # v4.3.0
+except Exception as _e:   # fail-open : moteur sans filtres externes
+    _feeds = None
 
 # ---------------------------------------------------------------- config
 def _load_env_file(path):
@@ -78,7 +83,24 @@ PAUSE_AFTER_LOSSES_MIN = E("PAUSE_AFTER_LOSSES_MIN", 120, int)
 RR = E("RR", 1.5, float)                          # v4.2 : TP à 1.5R (était 2.0)
 ATR_SL_MULT = E("ATR_SL_MULT", 1.5, float)
 MIN_SL_PCT = E("MIN_SL_PCT", 0.25, float)         # SL mini en % du prix (anti-bruit + frais)
-FEE_RATE = E("FEE_RATE", 0.0006, float)           # taker par côté
+FEE_RATE = E("FEE_RATE", 0.0006, float)
+# v4.3.0 : filtres (tous désactivables par variable d'environnement)
+V43_FILTERS = E("V43_FILTERS", True, bool)
+TREND_EMA = E("TREND_EMA", 50, int)
+TREND_SLOPE_BARS = E("TREND_SLOPE_BARS", 6, int)
+TREND_SLOPE_MIN = E("TREND_SLOPE_MIN", 0.15, float)
+OI_PCT = E("OI_PCT", 0.5, float)
+COUNTER_SIZE = E("COUNTER_SIZE", 0.5, float)
+FEE_GUARD = E("FEE_GUARD", 2.0, float)            # gain net au TP >= FEE_GUARD x frais A/R
+LIQ_CASCADE_USD = E("LIQ_CASCADE_USD", 20e6, float)
+LIQ_BLOCK_MIN = E("LIQ_BLOCK_MIN", 15, int)
+SPREAD_MULT = E("SPREAD_MULT", 3.0, float)
+BOOK_IMB = E("BOOK_IMB", 0.65, float)
+FUNDING_HOT = E("FUNDING_HOT", 0.0003, float)
+LS_Z = E("LS_Z", 2.0, float)
+OI_SPIKE_PCT = E("OI_SPIKE_PCT", 3.0, float)
+MACRO_BLOCK_MIN = E("MACRO_BLOCK_MIN", 15, int)
+SIZE_FLOOR = E("SIZE_FLOOR", 0.25, float)           # taker par côté
 MAX_FEE_SHARE = E("MAX_FEE_SHARE", 0.30, float)   # frais aller-retour max / risque
 POLL_SEC = E("POLL_SEC", 15, int)
 DB_PATH = E("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "journal.db"))
@@ -969,7 +991,7 @@ class Engine:
             return f"{tf} non tradé"
         return None
 
-    def plan(self, tf, side, a):
+    def plan(self, tf, side, a, sl_mult=None):
         px = self.price or a["close"]
         if REAL_ORDERS:  # prix frais (dernière bougie 1m en cours)
             try:
@@ -978,7 +1000,7 @@ class Engine:
                     px = float(k[0]["close"]); self.price = px
             except Exception as e:
                 log.warning("prix frais: %s", e)
-        sl_dist = max(ATR_SL_MULT * a["atr"], px * MIN_SL_PCT / 100)
+        sl_dist = max((sl_mult or ATR_SL_MULT) * a["atr"], px * MIN_SL_PCT / 100)
         sgn = 1 if side == "LONG" else -1
         sl, tp = px - sgn * sl_dist, px + sgn * RR * sl_dist
         eq = self.sizing_equity()
@@ -1020,6 +1042,12 @@ class Engine:
                 log.info("signal filtré %s %s %s : %s", tf, s["setup"], s["side"], s["filtered"])
                 continue
             p = self.plan(tf, s["side"], a)
+            skip43 = None
+            if V43_FILTERS and not s.get("info_only"):
+                try:
+                    skip43, p = self.v43_gate(tf, s, p, a)
+                except Exception as e43:   # fail-open
+                    log.warning("v43_gate %s: %s", tf, e43); self.db.ev("v43_gate_error", {"err": str(e43)[:200]}, level="WARNING")
             sid = self.db.x("INSERT INTO signals(ts,timeframe,setup,side,price,sl,tp,confidence,why) "
                             "VALUES(?,?,?,?,?,?,?,?,?)", (now_iso(), tf, s["setup"], s["side"], p["price"],
                                                          p["sl"], p["tp"], s["confidence"], s["why"])).lastrowid
@@ -1027,6 +1055,8 @@ class Engine:
             skip = None
             if s.get("info_only"):
                 skip = "info"
+            elif skip43:
+                skip = "v4.3: " + skip43
             elif s["confidence"] < MIN_CONF_TRADE:
                 skip = f"confiance {s['confidence']} < {MIN_CONF_TRADE}"
             elif (s["side"] == "LONG" and not (p["sl"] < p["price"] < p["tp"])) or \
@@ -1058,6 +1088,146 @@ class Engine:
                                  "equity": round(self.equity(), 2), "open_positions": len(self.open_trades()),
                                  "action": "not_taken", "skip_reason": skip, "signal_id": sid,
                                  "ctx": self.ctx_summary()}, key=f"{tf}:{s['setup']}:{s['side']}")
+
+    # ------------------------------------------------------------ v4.3.0 : filtres
+    def regime(self):
+        """Score de régime -3..+3 : pente EMA50 4h (/ATR4h) + côté VWAP (session & semaine) + OI/prix 1h."""
+        sc, det = 0, {}
+        c4 = self.candles.get("4h") or []
+        cl = [x["c"] for x in c4]
+        e = ema(cl, TREND_EMA) if len(cl) > TREND_EMA + TREND_SLOPE_BARS else []
+        a4 = (self.ctx.get("4h") or {}).get("atr")
+        if e and e[-1] and e[-1 - TREND_SLOPE_BARS] and a4:
+            slope = (e[-1] - e[-1 - TREND_SLOPE_BARS]) / a4
+            det["slope"] = round(slope, 3)
+            sc += 1 if slope > TREND_SLOPE_MIN else -1 if slope < -TREND_SLOPE_MIN else 0
+        px = self.price
+        c15, c1h = self.candles.get("15m") or [], self.candles.get("1h") or []
+        sv = session_vwap(c15)
+        wv = None
+        if c1h:
+            t = c1h[-1]["t"] // 1000; d = datetime.fromtimestamp(t, timezone.utc)
+            w0 = (t - d.weekday() * 86400 - d.hour * 3600 - d.minute * 60 - d.second) * 1000
+            seg = [x for x in c1h if x["t"] >= w0]
+            wv = vwap(seg) if seg else None
+        if px and sv and wv:
+            det["vwap_s"], det["vwap_w"] = round(sv, 1), round(wv, 1)
+            sc += 1 if px > sv and px > wv else -1 if px < sv and px < wv else 0
+        oi = self.feeds.get("oi") if getattr(self, "feeds", None) else None
+        if oi and len(c15) >= 5:
+            dp = c15[-1]["c"] - c15[-5]["c"]; do = oi["chg_1h_pct"]
+            det["oi_1h"] = round(do, 2)
+            if do > OI_PCT:
+                sc += 1 if dp > 0 else -1 if dp < 0 else 0
+        det["score"] = sc
+        return sc, det
+
+    def v43_gate(self, tf, s, p, a):
+        """Retour (raison_de_blocage | None, plan ajusté). Nouvelles entrées uniquement."""
+        side = s["side"]; sg = 1 if side == "LONG" else -1
+        F = getattr(self, "feeds", None)
+        g = (lambda k: F.get(k)) if F else (lambda k: None)
+        sc, det = self.regime()
+        notes, mult, sl_mult, tp_1r = [], 1.0, None, False
+        counter = sc != 0 and (sc > 0) != (side == "LONG")
+        # 1) tendance par TF
+        if counter:
+            if tf in ("1m", "5m"):
+                if abs(sc) > 2: return f"contre-tendance (score {sc:+d})", p
+                mult *= COUNTER_SIZE; tp_1r = True; notes.append(f"contre-tendance x{COUNTER_SIZE}")
+            elif tf == "15m":
+                if abs(sc) > 1 or s.get("setup") != "rsi_reversal":
+                    return f"contre-tendance 15m (score {sc:+d}, {s.get('setup')})", p
+            elif abs(sc) >= 2:
+                return f"contre-tendance HTF (score {sc:+d})", p
+        elif sc != 0 and tf in ("1h", "4h", "1d"):
+            s["confidence"] = round(s["confidence"] + 0.05, 3)
+        now = time.time()
+        # 2) macro : pas d'entrée +-15 min autour d'un événement USD majeur ; stop >= 2 ATR dans l'heure suivante
+        m = g("macro")
+        for ev_ in (m or {}).get("events", []):
+            dt = now - ev_["t"]
+            if -MACRO_BLOCK_MIN * 60 <= dt <= MACRO_BLOCK_MIN * 60:
+                return f"macro {ev_['title']}", p
+            if 0 < dt <= 3600: sl_mult = max(sl_mult or 0, 2.0)
+        # 3) liquidations : cascade -> pas d'entrée dans le sens de la mèche pendant 15 min
+        lq = g("liq")
+        if lq:
+            st = self.db.get("liq_block", {}) or {}
+            if lq["long_liq_5m"] >= LIQ_CASCADE_USD: st["SHORT"] = now + LIQ_BLOCK_MIN * 60
+            if lq["short_liq_5m"] >= LIQ_CASCADE_USD: st["LONG"] = now + LIQ_BLOCK_MIN * 60
+            self.db.set("liq_block", st)
+            if now < float(st.get(side, 0)): return "cascade de liquidations (sens de la mèche)", p
+        # 4) spread / carnet
+        b = g("book")
+        if b:
+            if b["spread_med_1h"] and b["spread"] > SPREAD_MULT * b["spread_med_1h"] and b["spread"] > 0.5:
+                return f"spread {b['spread']:.1f} > {SPREAD_MULT}x médiane", p
+            share = b["bid_share"] if side == "LONG" else 1 - b["bid_share"]
+            if share < 1 - BOOK_IMB: return f"carnet contraire ({share:.0%} de notre côté)", p
+        # 5) CVD / taker sur 1h
+        tk = g("taker")
+        if tk:
+            r = tk["buy_sell"]
+            if (side == "LONG" and r < 0.95) or (side == "SHORT" and r > 1.05):
+                return f"flux taker contraire (achat/vente {r:.2f})", p
+        # 6) funding
+        fd = g("funding")
+        fr = fd["rate"] if fd else 0.0
+        if sg * fr > FUNDING_HOT: mult *= 0.5; notes.append(f"funding {fr*100:.3f}% x0.5")
+        # 7) ratios L/S (z-score) : encombrement, HTF
+        ls = g("ls")
+        if ls and tf in ("1h", "4h", "1d"):
+            z = ls.get("z_top") or 0
+            if (side == "LONG" and z > LS_Z and fr > 0) or (side == "SHORT" and z < -LS_Z and fr < 0):
+                mult *= 0.5; notes.append(f"L/S encombré z={z:.1f} x0.5")
+        # 8) OI : pic => stop >= 2 ATR
+        oi = g("oi")
+        if oi and abs(oi["chg_1h_pct"]) >= OI_SPIKE_PCT: sl_mult = max(sl_mult or 0, 2.0); notes.append("pic OI stop 2ATR")
+        # 9) options : taille -30 % dans les 24 h avant l'échéance mensuelle ; basis ; niveaux -> TP
+        op = g("options")
+        if op:
+            try:
+                mexp = datetime.fromisoformat(op["monthly_expiry"]).timestamp()
+                if 0 < mexp - now <= 86400: mult *= 0.7; notes.append("échéance mensuelle x0.7")
+            except Exception: pass
+            bz = op.get("basis_ann_pct")
+            if bz is not None and bz > 15 and side == "LONG": mult *= 0.7; notes.append(f"basis {bz:.0f}% x0.7")
+        # 10) Coinbase premium / ETF (biais HTF)
+        cb = g("coinbase")
+        if cb and tf in ("1h", "4h", "1d"):
+            pr = cb["premium_pct"]
+            if (pr > 0.1 and side == "SHORT") or (pr < -0.1 and side == "LONG"): mult *= 0.7; notes.append(f"prime Coinbase {pr:+.2f}% x0.7")
+        et = g("etf")
+        if et:
+            if (et["net_musd"] > 300 and side == "SHORT") or (et["net_musd"] < -300 and side == "LONG"):
+                mult *= 0.8; notes.append(f"ETF {et['net_musd']:+.0f}M$ x0.8")
+        # --- application au plan
+        if sl_mult and sl_mult > ATR_SL_MULT:
+            p = self.plan(tf, side, a, sl_mult=sl_mult)
+        px, dist = p["price"], p["sl_dist"]
+        if tp_1r:
+            p["tp"] = round(px + sg * dist, self.px_prec)
+        if op and op.get("levels"):   # TP calé 0,1 % avant un gros niveau options situé entre l'entrée et le TP
+            lv = [L for L in op["levels"] if (L - px) * sg > dist * 0.8 and (p["tp"] - L) * sg > 0]
+            if lv:
+                L = min(lv, key=lambda L: abs(L - px))
+                p["tp"] = round(L - sg * L * 0.001, self.px_prec); notes.append(f"TP avant niveau options {L:.0f}")
+        mult = max(mult, SIZE_FLOOR) if mult < 1 else 1.0
+        if mult < 1:
+            p["qty"] = round_down(p["qty"] * mult, self.qty_prec)
+        p["fees"] = round(fee_estimate(p["qty"], px), 3)
+        p["risk_usdt"] = round(p["qty"] * dist + p["fees"], 3)
+        p["margin"] = round(p["qty"] * px / LEVERAGE, 3)
+        p["fee_share"] = p["fees"] / max(p["qty"] * dist, 1e-9)
+        # 11) TP net >= FEE_GUARD x frais
+        gross = abs(p["tp"] - px) * p["qty"]
+        if p["qty"] >= self.min_qty and gross - p["fees"] < FEE_GUARD * p["fees"]:
+            return f"TP net {gross - p['fees']:.2f} < {FEE_GUARD:g}x frais {p['fees']:.2f}", p
+        det["mult"], det["notes"] = round(mult, 3), notes
+        s["why"] = (s.get("why") or "") + f" | v4.3 score {sc:+d} {'; '.join(notes)}"
+        self.db.set("v43_last", {"ts": now_iso(), "tf": tf, "side": side, **det})
+        return None, p
 
     def ctx_summary(self):
         out = {tf: {"trend": a["trend"], "rsi": round(a["rsi"], 1) if a["rsi"] else None,
@@ -2584,11 +2754,19 @@ class Engine:
         self.digest()
         self.alert.tick(self)
         self.db.set("heartbeat", {"ts": now_iso(), "price": self.price, "equity": round(self.equity(), 3)})
+        if getattr(self, "feeds", None) and time.time() - getattr(self, "_fs_ts", 0) > 60:
+            self._fs_ts = time.time(); self.db.set("feeds_status", self.feeds.status())
 
     def run(self, once=False):
         self.init_exchange()
+        self.feeds = None
+        if V43_FILTERS and _feeds:
+            try:
+                self.feeds = _feeds.Feeds(SYMBOL, Bitunix(min_interval=0.3)); self.feeds.start()   # client séparé (thread)
+            except Exception as e:
+                log.warning("feeds non démarrés (fail-open): %s", e)
         self.db.ev("start", {"mode": self.mode, "auto_trade": AUTO_TRADE, "tfs": TIMEFRAMES, "lev": LEVERAGE,
-                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL), "version": "4.2.7",
+                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL), "version": "4.3.0",
                              "rr": RR, "partial": PARTIAL_TP, "max_fee_share": MAX_FEE_SHARE, "atr_min": ATR_MIN_PCT,
                              "vwap_obv": VWAP_OBV, "kronos": KRONOS_FILTER, "auto_kill": AUTO_KILL,
                              "max_per_tf": MAX_PER_TF, "entry_partial_keep": ENTRY_PARTIAL_KEEP,
