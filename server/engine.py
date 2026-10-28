@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Moteur trading v4.3.0 — (v4.3.0 : filtre de tendance par TF, filtres de marché feeds.py fail-open, TP net >= 2x frais, risque 3 %)
+"""Kairo 1 (v1.0.0, ex-v4.3.0) — moteur de trading IA de Bitixe.
+Moteur trading v4.3.0 — (v4.3.0 : filtre de tendance par TF, filtres de marché feeds.py fail-open, TP net >= 2x frais, risque 3 %)
 Moteur trading v4.2.7 — (v4.2.7 : positions/ordres MANUELS jamais touchés : orphelins = seulement ordres du moteur, qty étrangère protégée, flash_close interdit si position fusionnée, taille hors marge manuelle)
 Moteur trading v4.2.3 — BTCUSDT Bitunix USDT-M, isolé, hedge, multi-timeframes.
 
@@ -33,6 +34,9 @@ import os, sys, time, json, math, hashlib, secrets, sqlite3, signal, logging, th
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
+
+ENGINE_NAME = "Kairo 1"     # nom public (ex-trading v4)
+ENGINE_VERSION = "1.0.0"    # = v4.3.0 (voir CHANGELOG.md, correspondance des versions)
 try:
     import feeds as _feeds   # v4.3.0
 except Exception as _e:   # fail-open : moteur sans filtres externes
@@ -2766,7 +2770,7 @@ class Engine:
             except Exception as e:
                 log.warning("feeds non démarrés (fail-open): %s", e)
         self.db.ev("start", {"mode": self.mode, "auto_trade": AUTO_TRADE, "tfs": TIMEFRAMES, "lev": LEVERAGE,
-                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL), "version": "4.3.0",
+                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL), "version": ENGINE_VERSION, "name": ENGINE_NAME,
                              "rr": RR, "partial": PARTIAL_TP, "max_fee_share": MAX_FEE_SHARE, "atr_min": ATR_MIN_PCT,
                              "vwap_obv": VWAP_OBV, "kronos": KRONOS_FILTER, "auto_kill": AUTO_KILL,
                              "max_per_tf": MAX_PER_TF, "entry_partial_keep": ENTRY_PARTIAL_KEEP,
@@ -2833,6 +2837,7 @@ def main():
     ap.add_argument("--test-webhook", action="store_true")
     ap.add_argument("--status", action="store_true")
     a = ap.parse_args()
+    log.info("%s v%s (ex-v4.3.0)", ENGINE_NAME, ENGINE_VERSION)
     if REAL_ORDERS:
         log.warning("*** MODE LIVE : ORDRES RÉELS ***")
     else:

@@ -1,6 +1,8 @@
 <div align="center">
 
-# 🤖 Trading v4 — Agent IA de trading autonome
+# Kairo 1 — IA de trading autonome (ex-Trading v4)
+
+> Kairo 1 v1.0.0 = Trading v4.3.0. Voir CHANGELOG.md pour la correspondance des versions.
 
 **Un moteur de trading crypto qui tourne 24/7 sur un VPS, exécute ses propres trades sur Bitunix et rend compte à une équipe d'agents IA.**
 

@@ -1,4 +1,39 @@
-# Changelog — Trading v4
+# Changelog — Kairo (ex-Trading v4)
+
+## Kairo 1 — v1.0.0 — 2026-10-28
+- **Renommage** : le moteur « Trading v4 » devient **Kairo 1**, l'IA de trading de Bitixe. Version publique **1.0.0** = code de **v4.3.0** (aucun changement de logique, de stratégie, de chemins ni de service).
+- Nom/version affichés dans les logs (`Kairo 1 v1.0.0 (ex-v4.3.0)`) et dans l'événement `start` (`"version": "1.0.0"`, `"name": "Kairo 1"`).
+
+### Correspondance des versions
+Les anciennes versions deviennent des bêtas 0.x. **Tous les tags historiques `v4.*` sont conservés** ; les nouveaux tags pointent sur les mêmes commits.
+
+| Nouveau tag | Ancien tag |
+|---|---|
+| `v0.1.0` | `v4.0` |
+| `v0.1.1` | `v4.0.1` |
+| `v0.1.2` | `v4.0.2` |
+| `v0.1.3` | `v4.0.3` |
+| `v0.1.4` | `v4.0.4` |
+| `v0.1.5` | `v4.0-stable` |
+| `v0.2.0` | `v4.1` |
+| `v0.2.1` | `v4.1.1` |
+| `v0.2.2` | `v4.1.2` |
+| `v0.3.0` | `v4.2` |
+| `v0.3.1` | `v4.2.1` |
+| `v0.3.2` | `v4.2.2` |
+| `v0.3.3` | `v4.2.3` |
+| `v0.3.4` | `v4.2.4` |
+| `v0.3.5` | `v4.2.5` |
+| `v0.3.6` | `v4.2.6` |
+| `v0.3.7` | `v4.2.7` |
+| `v1.0.0` | `v4.3.0` |
+
+Alias historiques conservés sans nouveau tag : `v4.0-paper` (= `v0.1.0`), `v4.0-live` (= `v0.1.1`).
+Les générations antérieures (v1 à v3) n'ont pas de commit dans ce dépôt : elles ne sont pas taguées.
+
+---
+
+# Historique Trading v4
 
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/). Dates en UTC+8.
 
