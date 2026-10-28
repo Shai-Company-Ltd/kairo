@@ -120,3 +120,9 @@ Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/). Dat
 ## [v4.0] / [v4.0-paper] — 2026-10-21
 ### Ajouté
 - Premier moteur : BTCUSDT x20 isolé, indicateurs EMA20/50/200, RSI, ATR, VWAP, volume, funding ; setups `breakout`, `pullback_ema20`, `rsi_reversal` ; journal SQLite ; webhook vers l'équipe d'agents ; kill switch. Paper par défaut (`DRY_RUN=1`).
+
+## v4.2.7 (2026-10-28)
+- Positions/ordres manuels jamais touchés : cleanup_orphans n annule que des orderId posés/adoptés par le moteur (trades + events) ; ordre étranger loggué tpsl_foreign_kept.
+- Qty manuelle (position fusionnée) protégée : flash_close remplacé par safe_close_all (ferme seulement la qty moteur si qty étrangère), adoption refusée pour un ordre plus gros que le trade, ordres manuels ne "couvrent" pas un trade moteur.
+- SL (dont BE) : 2 essais supplémentaires puis événement tpsl_failed + alerte urgente.
+- Taille : base = equity moins marge+PnL latent de la part manuelle (min = available) ; levier/mode marge non modifiés au démarrage si position manuelle.

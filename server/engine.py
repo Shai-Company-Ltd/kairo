@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Moteur trading v4.2.3 — BTCUSDT Bitunix USDT-M, isolé, hedge, multi-timeframes.
+"""Moteur trading v4.2.7 — (v4.2.7 : positions/ordres MANUELS jamais touchés : orphelins = seulement ordres du moteur, qty étrangère protégée, flash_close interdit si position fusionnée, taille hors marge manuelle)
+Moteur trading v4.2.3 — BTCUSDT Bitunix USDT-M, isolé, hedge, multi-timeframes.
 
 v4.2.3 : réponses Bitunix dict OU liste (orderId), adoption de l'ordre existant avant/après chaque pose
 (jamais de doublon même si la pose échoue), nettoyage auto des TP/SL orphelins, fin de la boucle de re-pose SL.
@@ -752,7 +753,8 @@ class Engine:
                 a = a[0] if isinstance(a, list) else a
                 eq = account_equity(a, include_frozen=True)
                 self.db.set("live_equity", eq)
-                self._sizing_eq = account_equity(a, include_frozen=False)
+                self._sizing_eq = max(float(a.get("available", 0) or 0),
+                                      account_equity(a, include_frozen=False) - self._foreign_value())   # v4.2.7
                 return eq
             except Exception as e:
                 log.warning("account(): %s", e)
@@ -762,6 +764,19 @@ class Engine:
             if self.price:
                 eq += (1 if t["side"] == "LONG" else -1) * (self.price - t["entry"]) * t["qty"]
         return eq
+
+    def _foreign_value(self):
+        """v4.2.7 : marge + PnL latent de la part MANUELLE des positions (exclus de la base de taille)."""
+        v = 0.0
+        try:
+            for ps in self.api.positions(SYMBOL) or []:
+                q = float(ps.get("qty") or 0)
+                if q <= 0: continue
+                share = self.foreign_qty(ps.get("positionId"), q) / q
+                v += share * (float(ps.get("margin") or 0) + float(ps.get("unrealizedPNL") or 0))
+        except Exception as e:
+            log.warning("foreign_value: %s", e)
+        return max(0.0, v)
 
     def realized_equity(self):
         return self.db.get("paper_equity", START_EQUITY) if not REAL_ORDERS else self.equity()
@@ -1548,6 +1563,49 @@ class Engine:
         return sum(float(ps.get("qty") or 0) for ps in self.api.positions(SYMBOL)
                    if str(ps.get("positionId")) == str(pid))
 
+    # ---- v4.2.7 : protection des positions / ordres manuels (même compte, même positionId)
+    def own_ids_ever(self):
+        """Tous les orderId TP/SL que le moteur a un jour posés/adoptés (trades + events)."""
+        s = set()
+        for r in self.db.q("SELECT sl_order_id, tp_order_id FROM trades"):
+            s.update(str(v) for v in (r["sl_order_id"], r["tp_order_id"]) if v)
+        for r in self.db.q("SELECT data FROM events WHERE kind IN ('tpsl_placed','tpsl_adopted','tpsl_modified')"):
+            try:
+                o = json.loads(r["data"] or "{}").get("order")
+                if o: s.add(str(o))
+            except Exception: pass
+        return s
+
+    def engine_qty(self, pid):
+        return sum(float(t["qty"] or 0) for t in self.open_trades() if str(t.get("position_id")) == str(pid))
+
+    def foreign_qty(self, pid, pos=None):
+        """Qty de la position exchange qui n'appartient à AUCUN trade moteur ouvert (= manuelle)."""
+        pos = self.pos_qty(pid) if pos is None else pos
+        return max(0.0, pos - self.engine_qty(pid))
+
+    def _is_foreign_order(self, o, t=None, own=None):
+        own = self.own_ids_ever() if own is None else own
+        if str(o.get("id")) in own:
+            return False
+        if t is not None:   # ordre attaché à l'entrée (pas encore adopté) : qty <= qty demandée du trade
+            cap = max(float(t.get("qty") or 0), float(t.get("entry_req_qty") or 0), float(t.get("orig_qty") or 0))
+            return self._oqty(o) > cap + 1e-9
+        return True
+
+    def safe_close_all(self, t):
+        """Ferme la part moteur ; flash_close seulement si AUCUNE qty manuelle sur la position."""
+        pid = t["position_id"]
+        pos = self.pos_qty(pid)
+        fq = self.foreign_qty(pid, pos)
+        if fq < self.min_qty:
+            return self.api.flash_close(pid)
+        q = round_down(min(float(t["qty"]), pos - fq), self.qty_prec)
+        self.urgent("manual_pos", f"#{t['id']} position fusionnée avec {fq:.4f} manuel : seule la qty moteur {q} est fermée",
+                    key=f"merged_close:{t['id']}")
+        if q >= self.min_qty:
+            return self.api.close_qty(pid, t["side"], q, self.qty_prec)
+
     def own_tpsl(self, t, orders):
         """Ordres TP/SL de CE trade : uniquement par orderId (jamais par prix)."""
         ids = {str(t[k]) for k in ("sl_order_id", "tp_order_id") if t.get(k)}
@@ -1564,6 +1622,7 @@ class Engine:
             c = [o for o in pend or [] if str(o.get("positionId")) == str(t["position_id"]) and self._kind(o) == kind
                  and str(o.get("id")) not in claimed and o.get(f"{kind}Price")
                  and abs(float(o[f"{kind}Price"]) - float(t[kind])) < 0.06]
+            c = [o for o in c if not self._is_foreign_order(o, t)]   # v4.2.7 : jamais adopter un ordre manuel
             if c:
                 o = min(c, key=lambda o: abs(self._oqty(o) - t["qty"]))
                 self._set_oid(t, kind, o.get("id"))
@@ -1572,8 +1631,13 @@ class Engine:
     def _free_qty(self, t, kind, pos, pend):
         """Qty de la position non couverte par les ordres `kind` (sl ou tp) des AUTRES trades (et orphelins)."""
         mine = {str(t.get(f"{kind}_order_id"))}
-        used = sum(self._oqty(o) for o in pend if self._kind(o) == kind and str(o.get("id")) not in mine)
-        return max(0.0, pos - used)
+        own = self.own_ids_ever()   # v4.2.7 : ordres manuels comptés au plus pour la qty manuelle
+        used = sum(self._oqty(o) for o in pend if self._kind(o) == kind and str(o.get("id")) not in mine
+                   and str(o.get("id")) in own)
+        foreign = sum(self._oqty(o) for o in pend if self._kind(o) == kind and str(o.get("id")) not in own)
+        try: fq = self.foreign_qty(t["position_id"], pos)
+        except Exception: fq = 0.0
+        return max(0.0, pos - used - min(foreign, fq) if foreign <= fq + 1e-9 else pos - used - foreign)
 
     def _tp_limit_live(self, t):
         """TP limite déclenché : l'ordre limite de clôture est encore en carnet -> ne rien doubler."""
@@ -1619,7 +1683,7 @@ class Engine:
         c = [o for o in pend or [] if str(o.get("positionId")) == str(t["position_id"]) and self._kind(o) == kind
              and (str(o.get("id")) == mine or str(o.get("id")) not in claimed) and o.get(f"{kind}Price")
              and abs(float(o[f"{kind}Price"]) - float(price)) < 0.06]
-        return c
+        return [o for o in c if str(o.get("id")) == mine or not self._is_foreign_order(o, t)]   # v4.2.7
 
     def _adopt_existing(self, t, kind, price, q, pend, why):
         """Adopte un ordre existant (prix voulu, non revendiqué) au lieu d'en poser un autre."""
@@ -1758,7 +1822,8 @@ class Engine:
             log.error("pose %s #%s: %s", kind, t["id"], e); return "fail"
 
     def _covered(self, kind, pos, pend):
-        return sum(self._oqty(o) for o in pend if self._kind(o) == kind) >= pos - 1e-9
+        own = self.own_ids_ever()   # v4.2.7 : un ordre manuel ne "couvre" jamais un trade moteur
+        return sum(self._oqty(o) for o in pend if self._kind(o) == kind and str(o.get("id")) in own) >= pos - 1e-9
 
     def _sync(self, t, qty, sl, tp, modify, kinds=("sl", "tp")):
         """Relit position + ordres en attente, puis synchronise. Retour {kind: statut} ou 'closed'."""
@@ -1774,6 +1839,21 @@ class Engine:
         out = {}
         for kind in kinds:
             r = self._sync_kind(t, kind, sl if kind == "sl" else tp, qty, pos, pend, modify)
+            if r == "closed":
+                return "closed"
+            if r == "fail" and kind == "sl":   # v4.2.7 : SL (dont BE) : 2 essais de plus puis alerte
+                for i in range(2):
+                    time.sleep(1.0 + i)
+                    try:
+                        pos = self.pos_qty(t["position_id"]); pend = self.pend(t["position_id"])
+                        r = self._sync_kind(self._fresh(t) or t, kind, sl, qty, pos, pend, modify)
+                    except Exception as e:
+                        log.warning("retry sl #%s: %s", t["id"], e)
+                    if r != "fail": break
+                if r == "fail":
+                    self.db.ev("tpsl_failed", {"trade": t["id"], "kind": "sl", "price": sl, "qty": qty}, level="ERROR")
+                    self.urgent("no_sl", f"#{t['id']} SL {sl} (qty {qty}) impossible à poser après 3 essais",
+                                key=f"slfail:{t['id']}")
             if r == "closed":
                 return "closed"
             out[kind] = r
@@ -1930,7 +2010,7 @@ class Engine:
         others = [o for o in self.open_trades() if o["id"] != t["id"] and o["position_id"] == t["position_id"]]
         if not others:
             self._cancel_own(t)
-            return self.api.flash_close(t["position_id"])
+            return self.safe_close_all(t)   # v4.2.7
         pos_qty = self.pos_qty(t["position_id"])
         if not pos_qty:
             raise RuntimeError("position introuvable pour fermeture partielle")
@@ -1978,6 +2058,8 @@ class Engine:
         for t in opens:
             by_pid.setdefault(str(t["position_id"]), []).append(t)
         seen, cancelled = set(), []
+        own_ever = self.own_ids_ever()
+        if not hasattr(self, "_foreign_seen"): self._foreign_seen = set()
         for pid, trades in by_pid.items():
             if pid in keep_pids:
                 continue   # v4.2.5 : reste d'entrée en carnet (remplissages/TP-SL attachés à venir)
@@ -1995,6 +2077,12 @@ class Engine:
                 if not o.get("id") or oid in claimed:
                     continue
                 kind = self._kind(o)
+                if oid not in own_ever:   # v4.2.7 : ordre jamais posé par le moteur = manuel -> JAMAIS annulé
+                    if oid not in self._foreign_seen:
+                        self._foreign_seen.add(oid)
+                        self.db.ev("tpsl_foreign_kept", {"order": oid, "position": pid, "kind": kind,
+                                                         "price": o.get(f"{kind}Price"), "qty": self._oqty(o)})
+                    continue
                 if any(not t.get(f"{kind}_order_id") and o.get(f"{kind}Price") and
                        abs(float(o[f"{kind}Price"]) - float(t[kind])) < 0.06 for t in trades):
                     continue   # trade sans id pour ce type : candidat à l'adoption, pas un orphelin
@@ -2404,7 +2492,7 @@ class Engine:
                 except Exception as e: log.error("kill switch annulation entrées: %s", e)
             for t in self.open_trades():
                 if REAL_ORDERS and t["position_id"]:
-                    try: self.api.flash_close(t["position_id"])
+                    try: self.safe_close_all(t)   # v4.2.7
                     except Exception as e: log.error("flash_close: %s", e)
                 self.close_trade(t, self.price, "kill switch")
             self.alert.send({"type": "kill_switch", "equity": round(eq, 2), "price": self.price,
@@ -2466,7 +2554,13 @@ class Engine:
             self.qty_prec, self.px_prec = int(p.get("basePrecision", 4)), int(p.get("quotePrecision", 1))
         except Exception as e:
             log.warning("trading_pairs: %s (valeurs par défaut)", e)
-        if REAL_ORDERS:
+        manual = False
+        if REAL_ORDERS:   # v4.2.7 : position manuelle ouverte -> jamais changer levier/mode (affecterait la position)
+            try: manual = any(self.foreign_qty(ps.get("positionId"), float(ps.get("qty") or 0)) >= self.min_qty
+                              for ps in self.api.positions(SYMBOL) or [])
+            except Exception as e: manual = True; log.warning("positions au démarrage: %s", e)
+            if manual: log.warning("position manuelle détectée : levier/mode marge non modifiés")
+        if REAL_ORDERS and not manual:
             for fn, args in ((self.api.change_margin_mode, (SYMBOL, "ISOLATION")),
                              (self.api.change_leverage, (SYMBOL, LEVERAGE))):
                 try: fn(*args)
@@ -2494,7 +2588,7 @@ class Engine:
     def run(self, once=False):
         self.init_exchange()
         self.db.ev("start", {"mode": self.mode, "auto_trade": AUTO_TRADE, "tfs": TIMEFRAMES, "lev": LEVERAGE,
-                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL), "version": "4.2.6",
+                             "risk_pct": RISK_PCT, "webhook": bool(WEBHOOK_URL), "version": "4.2.7",
                              "rr": RR, "partial": PARTIAL_TP, "max_fee_share": MAX_FEE_SHARE, "atr_min": ATR_MIN_PCT,
                              "vwap_obv": VWAP_OBV, "kronos": KRONOS_FILTER, "auto_kill": AUTO_KILL,
                              "max_per_tf": MAX_PER_TF, "entry_partial_keep": ENTRY_PARTIAL_KEEP,
@@ -2542,7 +2636,7 @@ def start_control(eng):
             if self.path == "/close_all":
                 for t in eng.open_trades():
                     if REAL_ORDERS and t["position_id"]:
-                        try: eng.api.flash_close(t["position_id"])
+                        try: eng.safe_close_all(t)   # v4.2.7
                         except Exception as e: return self._send(500, {"error": str(e)})
                     eng.close_trade(t, eng.price, "fermeture manuelle")
                 return self._send(200, {"ok": True})
