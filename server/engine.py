@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kairo 1 (v1.0.0, ex-v4.3.0) — moteur de trading IA de Bitixe.
+"""Kairo 1 (v1.0.0, ex-v4.3.0) — moteur de trading IA autonome.
 Moteur trading v4.3.0 — (v4.3.0 : filtre de tendance par TF, filtres de marché feeds.py fail-open, TP net >= 2x frais, risque 3 %)
 Moteur trading v4.2.7 — (v4.2.7 : positions/ordres MANUELS jamais touchés : orphelins = seulement ordres du moteur, qty étrangère protégée, flash_close interdit si position fusionnée, taille hors marge manuelle)
 Moteur trading v4.2.3 — BTCUSDT Bitunix USDT-M, isolé, hedge, multi-timeframes.

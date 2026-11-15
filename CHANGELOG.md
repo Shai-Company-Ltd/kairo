@@ -1,7 +1,7 @@
 # Changelog — Kairo (ex-Trading v4)
 
 ## Kairo 1 — v1.0.0 — 2026-10-28
-- **Renommage** : le moteur « Trading v4 » devient **Kairo 1**, l'IA de trading de Bitixe. Version publique **1.0.0** = code de **v4.3.0** (aucun changement de logique, de stratégie, de chemins ni de service).
+- **Renommage** : le moteur « Trading v4 » devient **Kairo 1**, un moteur de trading autonome expérimental. Version publique **1.0.0** = code de **v4.3.0** (aucun changement de logique, de stratégie, de chemins ni de service).
 - Nom/version affichés dans les logs (`Kairo 1 v1.0.0 (ex-v4.3.0)`) et dans l'événement `start` (`"version": "1.0.0"`, `"name": "Kairo 1"`).
 
 ### Correspondance des versions

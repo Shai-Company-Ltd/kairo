@@ -90,14 +90,14 @@ e) Retour en paper à tout moment : DRY_RUN=1, LIVE=0, puis restart.
 ------------------
 sudo systemctl stop trading-v4      # arrête le moteur (les SL/TP restent posés chez Bitunix)
 Puis fermer la position à la main dans l'app Bitunix si besoin.
-Option : API de contrôle locale (CONTROL_PORT=8787, CONTROL_TOKEN=un_long_secret) :
+Option : API de contrôle locale (CONTROL_PORT=8787, CONTROL_TOKEN=change_me) :
   curl -H "Authorization: Bearer SECRET" http://127.0.0.1:8787/status
   curl -X POST -H "Authorization: Bearer SECRET" http://127.0.0.1:8787/pause
   curl -X POST -H "Authorization: Bearer SECRET" http://127.0.0.1:8787/resume
   curl -X POST -H "Authorization: Bearer SECRET" http://127.0.0.1:8787/close_all
 (Laisser CONTROL_BIND=127.0.0.1 ; ne pas l'ouvrir sur Internet sans HTTPS.)
 Après un kill switch (equity <= 12) : le moteur reste en HALT. Pour repartir,
-c'est une décision de Shaï : /resume ou supprimer la clé "halted" :
+c'est une décision de l'opérateur : /resume ou supprimer la clé "halted" :
   sqlite3 journal.db "DELETE FROM kv WHERE k='halted';" && sudo systemctl restart trading-v4
 
 10) MISE À JOUR

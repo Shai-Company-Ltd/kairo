@@ -8,3 +8,17 @@ __pycache__/
 hf_cache/
 kronos/repo/
 *.log
+
+# Secrets / credentials (never commit)
+.env.*
+!.env.example
+*.pem
+*.p12
+*.key
+*.keystore
+google-services.json
+*-service-account.json
+credentials.json
+secrets.json
+id_rsa
+id_rsa.pub

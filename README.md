@@ -1,3 +1,6 @@
+> **Projet archivé — n'est plus maintenu.**  
+> Kairo est un ancien moteur de trading expérimental, indépendant de tout autre produit. Ce dépôt est publié à titre d'archive ; aucune mise à jour n'est prévue. Ne l'utilisez pas avec des fonds réels et n'y commitez aucune clé.
+
 <div align="center">
 
 # Kairo 1 — IA de trading autonome (ex-Trading v4)
@@ -8,8 +11,8 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![Bitunix](https://img.shields.io/badge/Exchange-Bitunix%20Futures-F0B90B)
-![Statut](https://img.shields.io/badge/statut-LIVE-brightgreen)
-![Version](https://img.shields.io/badge/version-v4.1.1-blue)
+![Statut](https://img.shields.io/badge/statut-archivé-lightgrey)
+![Version](https://img.shields.io/badge/version-v1.0.0-blue)
 ![Licence](https://img.shields.io/badge/licence-propri%C3%A9taire-red)
 
 </div>
@@ -126,7 +129,7 @@ Par setup : `breakout` 36 trades (+3,75 USDT), `pullback_ema20` 18 trades (+3,61
 
 ```bash
 sudo useradd -r -m -d /opt/trading-v4 trader
-sudo -u trader git clone https://github.com/Dontbyshai/trading-v4.git /opt/trading-v4
+sudo -u trader git clone https://github.com/Shai-Company-Ltd/kairo.git /opt/trading-v4
 cd /opt/trading-v4/server
 sudo -u trader python3 -m venv venv && sudo -u trader venv/bin/pip install -r requirements.txt
 sudo -u trader cp ../.env.example .env && sudo chmod 600 .env   # puis éditer
